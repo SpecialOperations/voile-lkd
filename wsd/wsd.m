@@ -567,12 +567,14 @@ static void audio_clock_leave(WsdAudio *a) {
 @property(strong) NSMutableDictionary<NSNumber *, WsdBuffer *> *buffers;
 @property(strong) NSMutableDictionary<NSNumber *, WsdAudio *> *audio;
 @property(strong) NSMutableDictionary<NSNumber *, NSCursor *> *cursors; /* CURSOR_DEFINE */
+@property(strong) NSImage *appIconImage; /* last WSD_APP_ICON, applied once client owns a window */
 @property IOPMAssertionID displayAssertion; /* SCREEN_SAVER 0 holds the display on, kIOPMNullAssertionID otherwise */
 @property BOOL dead;
 - (void)send:(uint32_t)type payload:(const void *)p len:(uint32_t)n extra:(NSData *)extra;
 - (void)close;
 @end
 static void set_display_mode(WsdClient *client, uint32_t width, uint32_t height);
+static void maybe_apply_app_icon(WsdClient *client);
 
 /* The cursor is hidden while the client asks for it, unless one of its windows stopped showing frames. */
 static void sync_cursor(void) {
@@ -1821,6 +1823,9 @@ static CGPoint warp_point(WsdClient *c, int32_t x, int32_t y) {
   close(self.fd);
   LOG("client %d disconnected", self.pid);
   [g_clients removeObject:self];
+  for (WsdClient *c in g_clients) {
+    if (c.windows.count > 0 && c.appIconImage) maybe_apply_app_icon(c);
+  }
   if (g_mode_owner == self) set_display_mode(nil, 0, 0); /* the game that switched the display is gone */
   if (g_terminate_pending && g_clients.count == 0) {
     g_terminate_pending = NO;
@@ -1978,6 +1983,35 @@ static CGPoint warp_point(WsdClient *c, int32_t x, int32_t y) {
   }
 }
 
+static BOOL client_has_overlay(WsdClient *c) {
+  for (WsdWindow *w in c.windows.allValues) {
+    if (w.overlay) return YES;
+  }
+  return NO;
+}
+
+static void maybe_apply_app_icon(WsdClient *client) {
+  if (!client || client.dead || !client.appIconImage) return;
+  if (NSApp.applicationIconImage == client.appIconImage) return;
+  BOOL otherHasWindow = NO, otherHasOverlay = NO;
+  for (WsdClient *c in g_clients) {
+    if (c == client || c.dead) continue;
+    if (c.windows.count > 0) {
+      otherHasWindow = YES;
+      if (client_has_overlay(c)) otherHasOverlay = YES;
+    }
+  }
+  BOOL selfHasWindow = client.windows.count > 0;
+  BOOL selfHasOverlay = client_has_overlay(client);
+  BOOL allow = !NSApp.applicationIconImage ||
+               (!selfHasWindow && !otherHasWindow) ||
+               (selfHasWindow && (selfHasOverlay || !otherHasOverlay));
+  if (!allow) return;
+  NSApp.applicationIconImage = client.appIconImage;
+  LOG("client %d: applied application icon (%.0fx%.0f)", client.pid,
+      client.appIconImage.size.width, client.appIconImage.size.height);
+}
+
 /* The Dock and Cmd-Tab icon of the whole server (one game per wsd): the client's program icon. */
 - (void)appIcon:(const struct wsd_app_icon *)a {
   if (!self.fdQueue.count) { [self error:WSD_APP_ICON code:-EBADF]; return; }
@@ -2002,18 +2036,12 @@ static CGPoint warp_point(WsdClient *c, int32_t x, int32_t y) {
   CGColorSpaceRelease(srgb);
   CGDataProviderRelease(provider);
   if (!image) { [self error:WSD_APP_ICON code:-EINVAL]; return; }
-  BOOL anotherHasWindow = NO;
-  for (WsdClient *c in g_clients) {
-    if (c != self && c.windows.count > 0) { anotherHasWindow = YES; break; }
-  }
-  if (NSApp.applicationIconImage && anotherHasWindow && self.windows.count == 0) {
-    CGImageRelease(image);
-    LOG("client %d: ignoring application icon %ux%u (another client owns open window)", self.pid, a->width, a->height);
-    return;
-  }
-  NSApp.applicationIconImage = [[NSImage alloc] initWithCGImage:image size:NSZeroSize];
+  self.appIconImage = [[NSImage alloc] initWithCGImage:image size:NSZeroSize];
   CGImageRelease(image);
-  LOG("client %d: application icon %ux%u", self.pid, a->width, a->height);
+  maybe_apply_app_icon(self);
+  if (NSApp.applicationIconImage != self.appIconImage) {
+    LOG("client %d: deferring application icon %ux%u (waiting for window)", self.pid, a->width, a->height);
+  }
 }
 
 - (void)attachBuffer:(const struct wsd_buffer_attach *)a {
@@ -2148,6 +2176,7 @@ static CGPoint warp_point(WsdClient *c, int32_t x, int32_t y) {
       if (m->value == 1) [NSApp activate];
       [w orderInFront:m->value == 1];
       [w sendResize];
+      maybe_apply_app_icon(self);
       [w logState:"show"];
       __weak WsdWindow *ww = w;
       dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1000000000), dispatch_get_main_queue(), ^{ [ww logState:"show+1s"]; });
@@ -2382,6 +2411,7 @@ static CGPoint warp_point(WsdClient *c, int32_t x, int32_t y) {
     WsdBuffer *b = self.buffers[@(m->present.buffer_id)];
     if (!b) { [self error:type code:-ENOENT]; break; }
     WsdWindow *o = [w overlayAt:NSMakeRect(m->x, m->y, m->width, m->height)];
+    maybe_apply_app_icon(self);
     if (o.pendingBuffer) {
       [o releaseBuffer:o.pendingBuffer serial:o.pendingSerial shown:NO];
       o.replaced++;
