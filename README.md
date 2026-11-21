@@ -1,6 +1,41 @@
-# voile-lkd
+# voile-lkd (MetalFX Fork)
+
+> **Fork notice:** This is a fork of [Zagrios/voile-lkd](https://github.com/Zagrios/voile-lkd) by [@SpecialOperations](https://github.com/SpecialOperations), adding **MetalFX Spatial upscaling** and **2× color-only MetalFX Frame Generation** directly in the `wsd` window server. Upstream PR: [Zagrios/voile-lkd#26](https://github.com/Zagrios/voile-lkd/pull/26). Companion Obelisk fork with Launch Settings UI toggles: [SpecialOperations/Obelisk](https://github.com/SpecialOperations/Obelisk).
 
 **The Linux engine of [Voile](https://github.com/Zagrios/voile).** It runs unmodified x86-64 Linux programs in native macOS arm64 processes, with no virtual machine and no Hypervisor.framework.
+
+## Fork features (`wsd` MetalFX)
+
+- **MetalFX Spatial Upscaling (`--metalfx-spatial` / `WSD_METALFX_SPATIAL=1` / `WsdMetalFXSpatial`):**
+  - Automatically upscales game overlay planes rendered below native display pixels (via Obelisk's **Render resolution** slider, `SET_DISPLAY_MODE`, or lower in-game resolutions) using `MTLFXSpatialScaler`.
+  - Uses zero-copy direct linear texture input on Apple silicon (falling back to a private copy only if required) and supports `BGRA8`, `RGBA8`, and `RGB10A2` buffers.
+- **2× Color-Only MetalFX Frame Generation (`--metalfx-framegen` / `WSD_METALFX_FRAMEGEN=1` / `WsdMetalFXFrameGen`, macOS 26+):**
+  - Uses `MTLFXFrameInterpolator` in pure color-only optical-flow mode (no game depth/motion-vector hooks needed) with a private 2-slot history ring so guest swapchain buffers release immediately.
+  - Interpolates at the guest render resolution and chains into MetalFX Spatial when both are enabled, pacing generated and real frames across the `CADisplayLink` refresh grid.
+  - Automatically bypasses interpolation at native display refresh or across pauses over 250 ms.
+
+### Quick install (prebuilt release)
+
+Download from the [latest release](https://github.com/SpecialOperations/voile-lkd/releases/latest), or install directly into Obelisk's `Voile/current` runtime with one command (requires Apple silicon and at least one Voile release already installed by Obelisk):
+
+```sh
+curl -fsSL https://github.com/SpecialOperations/voile-lkd/releases/latest/download/install-metalfx-wsd.sh | bash
+```
+
+Use with [SpecialOperations/Obelisk](https://github.com/SpecialOperations/Obelisk/releases/latest) for built-in Launch Settings switches, or enable per game on stock Obelisk:
+
+```sh
+defaults write com.zagrios.obelisk.game.<GameName> WsdMetalFXSpatial -bool YES
+defaults write com.zagrios.obelisk.game.<GameName> WsdMetalFXFrameGen -bool YES
+```
+
+To revert to stock Voile at any time:
+
+```sh
+rm -rf "$HOME/Library/Application Support/com.zagrios.obelisk/Voile/current"
+```
+
+---
 
 [Obelisk](https://github.com/Zagrios/obelisk) uses it for Windows games whose anti-cheat supports Linux, such as Easy Anti-Cheat in Rocket League and ELDEN RING. The game runs in voile-wine built for Linux, and the anti-cheat loads its Linux module and sees a real Linux kernel interface.
 
