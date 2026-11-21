@@ -568,6 +568,7 @@ static void audio_clock_leave(WsdAudio *a) {
 @property(strong) NSMutableDictionary<NSNumber *, WsdAudio *> *audio;
 @property(strong) NSMutableDictionary<NSNumber *, NSCursor *> *cursors; /* CURSOR_DEFINE */
 @property(strong) NSImage *appIconImage; /* last WSD_APP_ICON, applied once client owns a window */
+@property BOOL appIconApplied;
 @property IOPMAssertionID displayAssertion; /* SCREEN_SAVER 0 holds the display on, kIOPMNullAssertionID otherwise */
 @property BOOL dead;
 - (void)send:(uint32_t)type payload:(const void *)p len:(uint32_t)n extra:(NSData *)extra;
@@ -1991,8 +1992,7 @@ static BOOL client_has_overlay(WsdClient *c) {
 }
 
 static void maybe_apply_app_icon(WsdClient *client) {
-  if (!client || client.dead || !client.appIconImage) return;
-  if (NSApp.applicationIconImage == client.appIconImage) return;
+  if (!client || client.dead || !client.appIconImage || client.appIconApplied) return;
   BOOL otherHasWindow = NO, otherHasOverlay = NO;
   for (WsdClient *c in g_clients) {
     if (c == client || c.dead) continue;
@@ -2007,7 +2007,9 @@ static void maybe_apply_app_icon(WsdClient *client) {
                (!selfHasWindow && !otherHasWindow) ||
                (selfHasWindow && (selfHasOverlay || !otherHasOverlay));
   if (!allow) return;
+  for (WsdClient *c in g_clients) c.appIconApplied = NO;
   NSApp.applicationIconImage = client.appIconImage;
+  client.appIconApplied = YES;
   LOG("client %d: applied application icon (%.0fx%.0f)", client.pid,
       client.appIconImage.size.width, client.appIconImage.size.height);
 }
@@ -2037,9 +2039,10 @@ static void maybe_apply_app_icon(WsdClient *client) {
   CGDataProviderRelease(provider);
   if (!image) { [self error:WSD_APP_ICON code:-EINVAL]; return; }
   self.appIconImage = [[NSImage alloc] initWithCGImage:image size:NSZeroSize];
+  self.appIconApplied = NO;
   CGImageRelease(image);
   maybe_apply_app_icon(self);
-  if (NSApp.applicationIconImage != self.appIconImage) {
+  if (!self.appIconApplied) {
     LOG("client %d: deferring application icon %ux%u (waiting for window)", self.pid, a->width, a->height);
   }
 }
