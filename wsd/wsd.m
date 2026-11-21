@@ -2002,6 +2002,15 @@ static CGPoint warp_point(WsdClient *c, int32_t x, int32_t y) {
   CGColorSpaceRelease(srgb);
   CGDataProviderRelease(provider);
   if (!image) { [self error:WSD_APP_ICON code:-EINVAL]; return; }
+  BOOL anotherHasWindow = NO;
+  for (WsdClient *c in g_clients) {
+    if (c != self && c.windows.count > 0) { anotherHasWindow = YES; break; }
+  }
+  if (NSApp.applicationIconImage && anotherHasWindow && self.windows.count == 0) {
+    CGImageRelease(image);
+    LOG("client %d: ignoring application icon %ux%u (another client owns open window)", self.pid, a->width, a->height);
+    return;
+  }
   NSApp.applicationIconImage = [[NSImage alloc] initWithCGImage:image size:NSZeroSize];
   CGImageRelease(image);
   LOG("client %d: application icon %ux%u", self.pid, a->width, a->height);
