@@ -4,21 +4,17 @@
 
 **The Linux engine of [Voile](https://github.com/Zagrios/voile).** It runs unmodified x86-64 Linux programs in native macOS arm64 processes, with no virtual machine and no Hypervisor.framework.
 
-## Fork features (`wsd` MetalFX)
+## Fork improvements
 
 - **MetalFX Spatial Upscaling (`--metalfx-spatial` / `WSD_METALFX_SPATIAL=1` / `WsdMetalFXSpatial`):**
-  - Automatically upscales game overlay planes rendered below native display pixels (via Obelisk's **Render resolution** slider, `SET_DISPLAY_MODE`, or lower in-game resolutions) using `MTLFXSpatialScaler`.
-  - Uses zero-copy direct linear texture input on Apple silicon (falling back to a private copy only if required) and supports `BGRA8`, `RGBA8`, and `RGB10A2` buffers.
+  - Sharply upscales games rendered below native display resolution (e.g. 50%–75% via Obelisk's **Render resolution** slider) to native Retina pixels using Apple's `MTLFXSpatialScaler` with zero-copy direct input.
 - **2× Color-Only MetalFX Frame Generation (`--metalfx-framegen` / `WSD_METALFX_FRAMEGEN=1` / `WsdMetalFXFrameGen`, macOS 26+):**
-  - Uses `MTLFXFrameInterpolator` in pure color-only optical-flow mode (no game depth/motion-vector hooks needed) with a private 2-slot history ring so guest swapchain buffers release immediately.
-  - Interpolates at the guest render resolution and chains into MetalFX Spatial when both are enabled, pacing generated and real frames across the `CADisplayLink` refresh grid.
-  - Automatically bypasses interpolation at native display refresh or across pauses over 250 ms.
-- **Additional stability fixes bundled in this fork & release installer:**
-  - **`wsd` Dock icon deferral:** Defers `WSD_APP_ICON` from windowless background helper processes (such as `yt-dlp.exe`) until a client shows a window or creates an overlay, so splash screens transition cleanly to the game icon while helpers never hijack it.
-  - **`fexdarwin-run` FEXCore push/pop/ret boundary fix ([Zagrios/voile-lkd#25](https://github.com/Zagrios/voile-lkd/issues/25)):** Prevents FEX's post-RA pass from merging `OP_PUSH`/`OP_POP` (including `pop reg; ret`) across guest instruction boundaries, fixing `NoExec instruction in entry block` crashes when Unity/Wine suspends threads ([patch](tools/patches/fex-no-cross-opcode-push-pop-merge.patch)).
-  - **`lkd` ptrace detached `SIGSTOP` guard:** Drops a synthetic `PTRACE_ATTACH` `SIGSTOP` if the tracer has already detached, preventing an orphaned Linux group stop from hanging all threads.
-  - **Neptune 512 MiB resource upload cap:** Raises `NPT_MAX_RESOURCE_UPDATE_BYTES` from 64 MiB to 512 MiB so large Unity texture/buffer uploads don't trigger `DXGI_ERROR_DEVICE_REMOVED` ([patch](tools/patches/neptune-512mib-resource-update-cap.patch)).
-  - **Wine 11.0 `mf.dll` `audio_renderer_stream_Flush` null-client guard:** Idempotent binary patch ([tools/patch-wine-mf-sar-flush.py](tools/patch-wine-mf-sar-flush.py)) backporting Wine 11.19's null check before `IAudioClient_Reset` to stop AVProVideo MediaFoundation flush crashes.
+  - Uses Apple's color-only `MTLFXFrameInterpolator` to double perceived smoothness on high-refresh displays (chaining directly into MetalFX Spatial when both are enabled) without needing per-game motion vectors or depth buffers.
+- **Stability & quality-of-life fixes** (included in the prebuilt release & one-line installer):
+  - **Higher GPU upload limit:** Raises Neptune's per-call resource upload limit to 512 MiB so heavy worlds and assets load without device-removed crashes ([patch](tools/patches/neptune-512mib-resource-update-cap.patch)).
+  - **World-load & thread-suspension stability:** Fixes an x86-64 emulation crash during thread suspension ([Zagrios/voile-lkd#25](https://github.com/Zagrios/voile-lkd/issues/25), [patch](tools/patches/fex-no-cross-opcode-push-pop-merge.patch)) and guards against an orphaned ptrace stop hang.
+  - **In-game video playback stability:** Patches a Wine 11.0 MediaFoundation audio flush crash when switching or seeking in-game video players ([patcher](tools/patch-wine-mf-sar-flush.py)).
+  - **Clean Dock icon handling:** Prevents background helper processes (like `yt-dlp`) from taking over the game's Dock icon while still letting splash screens transition cleanly to the main game icon.
 
 ### Quick install (prebuilt release)
 
