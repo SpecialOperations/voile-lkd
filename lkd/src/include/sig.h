@@ -34,6 +34,9 @@ int lkd_sig_send_pgrp(lkd_task *sender, int32_t pgrp, int signo, const struct lx
  * thread of the parent, SIGALRM from a timer, the fault path. thread_directed selects t's own pending
  * set instead of the process set. */
 void lkd_sig_send_task(lkd_task *target, int signo, const struct lx_siginfo *info, int thread_directed);
+/* Discard a pending thread-directed PTRACE_ATTACH SIGSTOP (SI_KERNEL, pid 0) when a tracer detaches
+ * after handling another stop first (e.g. SIGUSR1). */
+void lkd_sig_discard_attach_sigstop(lkd_task *t);
 
 /* SIGCHLD to the parent of a child whose state changed (code is a CLD_*, status the exit status or
  * signal). Honors SA_NOCLDSTOP, SA_NOCLDWAIT and SIG_IGN for the parent (which can make the child

@@ -15,6 +15,7 @@ LKD_WEAK void lkd_sig_send_task(lkd_task *target, int signo, const struct lx_sig
     atomic_fetch_or(&target->pending.bits, LX_SIGBIT(signo));
     atomic_fetch_or(&target->flags, LKD_TF_SIGPENDING);
     lkd_task_wake(target); } }
+LKD_WEAK void lkd_sig_discard_attach_sigstop(lkd_task *t) { (void)t; }
 LKD_WEAK int lkd_sig_child_event(int32_t pp, int32_t cp, uint32_t uid, int code, int status)
 { (void)pp; (void)cp; (void)uid; (void)code; (void)status; return 0; }
 

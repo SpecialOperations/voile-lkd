@@ -318,3 +318,33 @@ void lkd_sig_send_task(lkd_task *target, int signo, const struct lx_siginfo *inf
 {
     sig_send_task_full(target, signo, info, thread_directed, 0);
 }
+
+void lkd_sig_discard_attach_sigstop(lkd_task *t)
+{
+    if (!t || !t->proc) return;
+    struct lkd_sigproc *sp = sig_proc(t->proc);
+    struct sig_task *st = sig_task_of(t);
+    sig_lock(sp);
+    if (atomic_load(&t->pending.bits) & LX_SIGBIT(LX_SIGSTOP)) {
+        struct sq_node **pp = &st->q.head;
+        int more = 0, removed = 0;
+        while (*pp) {
+            struct sq_node *n = *pp;
+            if (n->info.si_signo == LX_SIGSTOP) {
+                if (!removed && n->info.si_code == LX_SI_KERNEL && n->info.u.kill.pid == 0) {
+                    *pp = n->next;
+                    free(n);
+                    if (sp->queued) sp->queued--;
+                    removed = 1;
+                    continue;
+                }
+                more = 1;
+            }
+            pp = &n->next;
+        }
+        st->q.tail = pp;
+        if (removed && !more) atomic_fetch_and(&t->pending.bits, ~LX_SIGBIT(LX_SIGSTOP));
+        sig_recalc_locked(t, sp);
+    }
+    sig_unlock(sp);
+}

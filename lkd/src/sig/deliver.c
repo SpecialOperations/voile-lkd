@@ -305,7 +305,9 @@ int lkd_signal_next(lkd_task *t)
         sig_recalc_locked(t, sp);
         sig_unlock(sp);
 
-        if ((atomic_load(&t->ptrace.flags) & LKD_PT_TRACED) && sig != LX_SIGKILL) {
+        if (((atomic_load(&t->ptrace.flags) & LKD_PT_TRACED) ||
+             (sig == LX_SIGSTOP && info.si_code == LX_SI_KERNEL && lkd_ptrace_tracer_of(t->tid) != 0)) &&
+            sig != LX_SIGKILL) {
             int ns = lkd_ptrace_signal_stop(t, sig, &info);
             if (ns < 0) { atomic_fetch_or(&t->flags, LKD_TF_FATAL); return die(t); }
             if (ns == 0) continue;

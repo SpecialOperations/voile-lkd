@@ -320,7 +320,10 @@ int pt_do_stop(lkd_task *t, const struct pt_stop_req *rq, struct pt_resume *out)
     apply_resume(t, L, out, nfx, fx_dirty, nxs, nxlen, xs_dirty, newmask, mask_dirty);
     free(nfx);
     free(nxs);
-    if (out->detached) L->slot = -1;
+    if (out->detached) {
+        L->slot = -1;
+        lkd_sig_discard_attach_sigstop(t);
+    }
     pt_sync_flags(t);
     lkd_registry_publish(t);
     return 1;
@@ -418,7 +421,13 @@ void lkd_ptrace_syscall_exit_replaced(lkd_task *t)
 
 int lkd_ptrace_signal_stop(lkd_task *t, int signo, struct lx_siginfo *info)
 {
-    if (!(atomic_load(&t->ptrace.flags) & LKD_PT_TRACED)) return signo;
+    if (!(atomic_load(&t->ptrace.flags) & LKD_PT_TRACED)) {
+        if (signo == LX_SIGSTOP && info && info->si_code == LX_SI_KERNEL && pt_my_slot(t) >= 0) {
+            pt_sync_flags(t);
+        } else {
+            return signo;
+        }
+    }
     struct pt_stop_req q;
     memset(&q, 0, sizeof q);
     q.kind = PK_SIGNAL;
