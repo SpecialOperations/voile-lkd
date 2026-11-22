@@ -10,9 +10,11 @@
   - Sharply upscales games rendered below native display resolution (e.g. 50%–75% via Obelisk's **Render resolution** slider) to native Retina pixels using Apple's `MTLFXSpatialScaler` with zero-copy direct input.
 - **2× Color-Only MetalFX Frame Generation (`--metalfx-framegen` / `WSD_METALFX_FRAMEGEN=1` / `WsdMetalFXFrameGen`, macOS 26+):**
   - Uses Apple's color-only `MTLFXFrameInterpolator` to double perceived smoothness on high-refresh displays (chaining directly into MetalFX Spatial when both are enabled) without needing per-game motion vectors or depth buffers.
+- **Mic Voice Isolation & Speaker Echo Cancellation (`--voice-processing` / `WSD_VOICE_PROCESSING=1` / `WsdVoiceProcessing`):**
+  - Routes game audio output and microphone capture through a unified CoreAudio `kAudioUnitSubType_VoiceProcessingIO` hub, giving Apple's hardware acoustic echo canceller the exact speaker reference and enabling macOS Control Center's **Voice Isolation** mic mode to suppress speaker bleed and background noise.
 - **Stability & quality-of-life fixes** (included in the prebuilt release & one-line installer):
   - **Higher GPU upload limit:** Raises Neptune's per-call resource upload limit to 512 MiB so heavy worlds and assets load without device-removed crashes ([patch](tools/patches/neptune-512mib-resource-update-cap.patch)).
-  - **World-load & thread-suspension stability:** Fixes an x86-64 emulation crash during thread suspension ([Zagrios/voile-lkd#25](https://github.com/Zagrios/voile-lkd/issues/25), [patch](tools/patches/fex-no-cross-opcode-push-pop-merge.patch)) and guards against an orphaned ptrace stop hang.
+  - **World-load & thread-suspension stability:** Fixes an x86-64 emulation crash during thread suspension ([Zagrios/voile-lkd#25](https://github.com/Zagrios/voile-lkd/issues/25), [patch](tools/patches/fex-no-cross-opcode-push-pop-merge.patch)) and fixes ptrace attach/detach `SIGSTOP` races that could deadlock threads under heavy GC/suspension churn.
   - **In-game video playback stability:** Patches a Wine 11.0 MediaFoundation audio flush crash when switching or seeking in-game video players ([patcher](tools/patch-wine-mf-sar-flush.py)).
   - **Clean Dock icon handling:** Prevents background helper processes (like `yt-dlp`) from taking over the game's Dock icon while still letting splash screens transition cleanly to the main game icon.
 
@@ -29,6 +31,7 @@ Use with [SpecialOperations/Obelisk](https://github.com/SpecialOperations/Obelis
 ```sh
 defaults write com.zagrios.obelisk.game.<GameName> WsdMetalFXSpatial -bool YES
 defaults write com.zagrios.obelisk.game.<GameName> WsdMetalFXFrameGen -bool YES
+defaults write com.zagrios.obelisk.game.<GameName> WsdVoiceProcessing -bool YES
 ```
 
 To revert to stock Voile at any time:

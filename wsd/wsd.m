@@ -45,6 +45,7 @@ static int g_render_percent = 100; /* --render-percent, 1 to 100 (PROTOCOL.md, "
 static double g_render_fraction;
 static BOOL g_spatial_upscale;
 static BOOL g_frame_gen;
+static BOOL g_voice_processing;
 static uint32_t g_mode_width_px, g_mode_height_px; /* SET_DISPLAY_MODE: the size a game switched the display to, 0: that side is not lowered */
 static __weak id g_mode_owner;          /* the client that set it, which takes it back when it goes (a WsdClient) */
 static BOOL g_injecting;       /* set while DEBUG_INJECT feeds synthetic events */
@@ -290,16 +291,14 @@ struct wsd_audio_rt {
   uint8_t *out;                /* what conv made of it, in the client's format */
 };
 
-static OSStatus audio_render(void *ref, AudioUnitRenderActionFlags *flags, const AudioTimeStamp *ts, UInt32 bus,
-                             UInt32 frames, AudioBufferList *io) {
-  struct wsd_audio_rt *rt = ref;
-  uint8_t *out = io->mBuffers[0].mData;
-  uint32_t want = frames, got = 0;
-  (void)ts; (void)bus;
+/* Pull up to `want` frames from an output stream's ring into `dst` (at least `want * rt->frame_bytes`),
+ * padding any shortfall with `rt->silence`. Returns the number of real frames pulled (0 if stopped or empty). */
+static uint32_t audio_ring_pull(struct wsd_audio_rt *rt, uint8_t *dst, uint32_t want) {
+  uint32_t got = 0;
   if (atomic_load_explicit(&rt->running, memory_order_acquire)) {
     _Atomic uint64_t *wp = (_Atomic uint64_t *)&rt->ring->write_frames, *rp = (_Atomic uint64_t *)&rt->ring->read_frames;
     /* the device reads the ring again: the clock waits three of its renders, at least AUDIO_PATIENCE_NS */
-    uint64_t renders = 3 * (uint64_t)frames * NSEC_PER_SEC / rt->rate;
+    uint64_t renders = 3 * (uint64_t)want * NSEC_PER_SEC / rt->rate;
     atomic_store_explicit(&rt->patience_ns, renders > AUDIO_PATIENCE_NS ? renders : AUDIO_PATIENCE_NS, memory_order_relaxed);
     atomic_store_explicit(&rt->pulled_ns, now_ns(), memory_order_release);
     uint64_t w = atomic_load_explicit(wp, memory_order_acquire), r = atomic_load_explicit(rp, memory_order_acquire);
@@ -309,14 +308,37 @@ static OSStatus audio_render(void *ref, AudioUnitRenderActionFlags *flags, const
     for (uint32_t done = 0; done < got;) {
       uint32_t pos = (uint32_t)((r + done) % rt->ring_frames), n = rt->ring_frames - pos;
       if (n > got - done) n = got - done;
-      memcpy(out + (size_t)done * rt->frame_bytes, rt->data + (size_t)pos * rt->frame_bytes, (size_t)n * rt->frame_bytes);
+      memcpy(dst + (size_t)done * rt->frame_bytes, rt->data + (size_t)pos * rt->frame_bytes, (size_t)n * rt->frame_bytes);
       done += n;
     }
     /* fails when the clock read the ring meanwhile, on its last turn: its position stands */
     atomic_compare_exchange_strong_explicit(rp, &r, r + got, memory_order_release, memory_order_relaxed);
     if (got < want) rt->ring->underrun_frames += want - got;
   }
-  if (got < want) memset(out + (size_t)got * rt->frame_bytes, rt->silence, (size_t)(want - got) * rt->frame_bytes);
+  if (got < want) memset(dst + (size_t)got * rt->frame_bytes, rt->silence, (size_t)(want - got) * rt->frame_bytes);
+  return got;
+}
+
+static void audio_ring_push(struct wsd_audio_rt *rt, const uint8_t *src, uint32_t got) {
+  _Atomic uint64_t *wp = (_Atomic uint64_t *)&rt->ring->write_frames, *rp = (_Atomic uint64_t *)&rt->ring->read_frames;
+  uint64_t w = atomic_load_explicit(wp, memory_order_relaxed), r = atomic_load_explicit(rp, memory_order_acquire);
+  uint64_t used = w > r ? w - r : 0;
+  uint32_t space = used >= rt->ring_frames ? 0 : (uint32_t)(rt->ring_frames - used), n = got < space ? got : space;
+  for (uint32_t done = 0; done < n;) {
+    uint32_t pos = (uint32_t)((w + done) % rt->ring_frames), k = rt->ring_frames - pos;
+    if (k > n - done) k = n - done;
+    memcpy(rt->data + (size_t)pos * rt->frame_bytes, src + (size_t)done * rt->frame_bytes, (size_t)k * rt->frame_bytes);
+    done += k;
+  }
+  atomic_store_explicit(wp, w + n, memory_order_release);
+  if (n < got) rt->ring->underrun_frames += got - n; /* the client did not read: these frames are lost */
+}
+
+static OSStatus audio_render(void *ref, AudioUnitRenderActionFlags *flags, const AudioTimeStamp *ts, UInt32 bus,
+                             UInt32 frames, AudioBufferList *io) {
+  struct wsd_audio_rt *rt = ref;
+  (void)ts; (void)bus;
+  uint32_t got = audio_ring_pull(rt, io->mBuffers[0].mData, frames);
   if (got == 0 && flags) *flags |= kAudioUnitRenderAction_OutputIsSilence;
   return noErr;
 }
@@ -352,19 +374,255 @@ static OSStatus audio_capture(void *ref, AudioUnitRenderActionFlags *flags, cons
   UInt32 got = rt->out_frames;
   AudioBufferList out = {1, {{rt->channels, got * rt->frame_bytes, rt->out}}};
   AudioConverterFillComplexBuffer(rt->conv, capture_feed, &feed, &got, &out, NULL);
-  _Atomic uint64_t *wp = (_Atomic uint64_t *)&rt->ring->write_frames, *rp = (_Atomic uint64_t *)&rt->ring->read_frames;
-  uint64_t w = atomic_load_explicit(wp, memory_order_relaxed), r = atomic_load_explicit(rp, memory_order_acquire);
-  uint64_t used = w > r ? w - r : 0;
-  uint32_t space = used >= rt->ring_frames ? 0 : (uint32_t)(rt->ring_frames - used), n = got < space ? got : space;
-  for (uint32_t done = 0; done < n;) {
-    uint32_t pos = (uint32_t)((w + done) % rt->ring_frames), k = rt->ring_frames - pos;
-    if (k > n - done) k = n - done;
-    memcpy(rt->data + (size_t)pos * rt->frame_bytes, rt->out + (size_t)done * rt->frame_bytes, (size_t)k * rt->frame_bytes);
-    done += k;
-  }
-  atomic_store_explicit(wp, w + n, memory_order_release);
-  if (n < got) rt->ring->underrun_frames += got - n; /* the client did not read: these frames are lost */
+  audio_ring_push(rt, rt->out, got);
   return noErr;
+}
+
+/* Shared VoiceProcessingIO audio hub (--voice-processing / WSD_VOICE_PROCESSING / WsdVoiceProcessing):
+ * Routes all game playback through Bus 0 (stereo float32) and captures the mic from Bus 1 (mono float32) on a
+ * single kAudioUnitSubType_VoiceProcessingIO unit. Because Bus 0 carries the game's speaker output, Apple's
+ * hardware-tuned Acoustic Echo Cancellation (AEC) subtracts speaker audio (including other players' voices and
+ * music) from the microphone, and macOS enables the per-app Control Center Mic Mode picker (Voice Isolation). */
+#define WSD_VPIO_MAX_SLOTS 64
+#define WSD_VPIO_MAX_FRAMES 4096
+
+struct wsd_vpio_slot {
+  _Atomic(struct wsd_audio_rt *) rt;
+  _Atomic int active; /* 1 while real-time callbacks may access rt; 0 when detaching */
+  _Atomic int busy;   /* count of callbacks currently reading/writing this slot */
+};
+
+static struct {
+  AudioComponentInstance unit; /* on g_audio_queue only (valid while any callback runs) */
+  uint32_t rate;               /* hardware sample rate (typically 48000 Hz) */
+  uint32_t scratch_frames;
+  float *in_scratch;           /* Bus 1 mono float32 capture buffer */
+  float *mix_scratch;          /* Bus 0 per-stream stereo float32 mix scratch buffer */
+  int attached;                /* open WsdAudio streams attached to this hub (on g_audio_queue) */
+  int started;                 /* started WsdAudio streams (on g_audio_queue) */
+  struct wsd_vpio_slot out_slots[WSD_VPIO_MAX_SLOTS];
+  struct wsd_vpio_slot in_slots[WSD_VPIO_MAX_SLOTS];
+} g_vpio;
+
+struct wsd_vpio_out_feed { struct wsd_audio_rt *rt; uint32_t got; };
+
+static OSStatus vpio_out_feed(AudioConverterRef c, UInt32 *packets, AudioBufferList *io,
+                              AudioStreamPacketDescription **desc, void *ref) {
+  struct wsd_vpio_out_feed *f = ref;
+  struct wsd_audio_rt *rt = f->rt;
+  (void)c; (void)desc;
+  uint32_t want = *packets;
+  if (want > rt->out_frames) want = rt->out_frames;
+  f->got += audio_ring_pull(rt, rt->out, want);
+  *packets = want;
+  io->mBuffers[0].mNumberChannels = rt->channels;
+  io->mBuffers[0].mDataByteSize = want * rt->frame_bytes;
+  io->mBuffers[0].mData = rt->out;
+  return noErr;
+}
+
+static OSStatus vpio_render(void *ref, AudioUnitRenderActionFlags *flags, const AudioTimeStamp *ts, UInt32 bus,
+                            UInt32 frames, AudioBufferList *io) {
+  (void)ref; (void)ts; (void)bus;
+  float *dst = io->mBuffers[0].mData;
+  uint32_t samples = frames * 2;
+  memset(dst, 0, (size_t)samples * sizeof(float));
+  if (frames > g_vpio.scratch_frames) {
+    if (flags) *flags |= kAudioUnitRenderAction_OutputIsSilence;
+    return noErr;
+  }
+  int mixed = 0;
+  for (int i = 0; i < WSD_VPIO_MAX_SLOTS; i++) {
+    if (!atomic_load_explicit(&g_vpio.out_slots[i].active, memory_order_acquire)) continue;
+    atomic_fetch_add_explicit(&g_vpio.out_slots[i].busy, 1, memory_order_acq_rel);
+    if (!atomic_load_explicit(&g_vpio.out_slots[i].active, memory_order_acquire)) {
+      atomic_fetch_sub_explicit(&g_vpio.out_slots[i].busy, 1, memory_order_release);
+      continue;
+    }
+    struct wsd_audio_rt *rt = atomic_load_explicit(&g_vpio.out_slots[i].rt, memory_order_acquire);
+    if (rt && atomic_load_explicit(&rt->running, memory_order_acquire)) {
+      uint32_t got = 0;
+      if (!rt->conv) {
+        got = audio_ring_pull(rt, (uint8_t *)g_vpio.mix_scratch, frames);
+      } else {
+        struct wsd_vpio_out_feed feed = {rt, 0};
+        UInt32 out_f = frames;
+        AudioBufferList abl = {1, {{2, frames * 2 * (UInt32)sizeof(float), g_vpio.mix_scratch}}};
+        if (AudioConverterFillComplexBuffer(rt->conv, vpio_out_feed, &feed, &out_f, &abl, NULL) == noErr) {
+          if (out_f < frames)
+            memset(g_vpio.mix_scratch + out_f * 2, 0, (size_t)(frames - out_f) * 2 * sizeof(float));
+          got = feed.got;
+        }
+      }
+      if (got > 0) {
+        if (mixed == 0) {
+          memcpy(dst, g_vpio.mix_scratch, (size_t)samples * sizeof(float));
+        } else {
+          for (uint32_t k = 0; k < samples; k++) dst[k] += g_vpio.mix_scratch[k];
+        }
+        mixed++;
+      }
+    }
+    atomic_fetch_sub_explicit(&g_vpio.out_slots[i].busy, 1, memory_order_release);
+  }
+  if (mixed > 1) {
+    for (uint32_t k = 0; k < samples; k++) {
+      if (dst[k] > 1.0f) dst[k] = 1.0f;
+      else if (dst[k] < -1.0f) dst[k] = -1.0f;
+    }
+  }
+  if (mixed == 0 && flags) *flags |= kAudioUnitRenderAction_OutputIsSilence;
+  return noErr;
+}
+
+struct wsd_vpio_in_feed { float *src; uint32_t frames; int given; };
+
+static OSStatus vpio_in_feed(AudioConverterRef c, UInt32 *packets, AudioBufferList *io,
+                             AudioStreamPacketDescription **desc, void *ref) {
+  struct wsd_vpio_in_feed *f = ref;
+  (void)c; (void)desc;
+  if (f->given) { *packets = 0; return 1; }
+  f->given = 1;
+  *packets = f->frames;
+  io->mBuffers[0].mNumberChannels = 1;
+  io->mBuffers[0].mDataByteSize = f->frames * (UInt32)sizeof(float);
+  io->mBuffers[0].mData = f->src;
+  return noErr;
+}
+
+static OSStatus vpio_capture(void *ref, AudioUnitRenderActionFlags *flags, const AudioTimeStamp *ts, UInt32 bus,
+                             UInt32 frames, AudioBufferList *unused) {
+  (void)ref; (void)unused;
+  if (!g_vpio.unit || frames > g_vpio.scratch_frames) return noErr;
+  AudioBufferList in = {1, {{1, frames * (UInt32)sizeof(float), g_vpio.in_scratch}}};
+  OSStatus e = AudioUnitRender(g_vpio.unit, flags, ts, bus, frames, &in);
+  if (e != noErr) return e;
+  for (int i = 0; i < WSD_VPIO_MAX_SLOTS; i++) {
+    if (!atomic_load_explicit(&g_vpio.in_slots[i].active, memory_order_acquire)) continue;
+    atomic_fetch_add_explicit(&g_vpio.in_slots[i].busy, 1, memory_order_acq_rel);
+    if (!atomic_load_explicit(&g_vpio.in_slots[i].active, memory_order_acquire)) {
+      atomic_fetch_sub_explicit(&g_vpio.in_slots[i].busy, 1, memory_order_release);
+      continue;
+    }
+    struct wsd_audio_rt *rt = atomic_load_explicit(&g_vpio.in_slots[i].rt, memory_order_acquire);
+    if (rt && atomic_load_explicit(&rt->running, memory_order_acquire)) {
+      if (!rt->conv) {
+        audio_ring_push(rt, (const uint8_t *)g_vpio.in_scratch, frames);
+      } else {
+        struct wsd_vpio_in_feed feed = {g_vpio.in_scratch, frames, 0};
+        UInt32 got = rt->out_frames;
+        AudioBufferList out = {1, {{rt->channels, got * rt->frame_bytes, rt->out}}};
+        AudioConverterFillComplexBuffer(rt->conv, vpio_in_feed, &feed, &got, &out, NULL);
+        if (got > 0) audio_ring_push(rt, rt->out, got);
+      }
+    }
+    atomic_fetch_sub_explicit(&g_vpio.in_slots[i].busy, 1, memory_order_release);
+  }
+  return noErr;
+}
+
+/* On g_audio_queue: initialize the shared VoiceProcessingIO unit if not already active. */
+static OSStatus vpio_ensure(void) {
+  if (g_vpio.unit) return noErr;
+  AudioComponentDescription desc = {kAudioUnitType_Output, kAudioUnitSubType_VoiceProcessingIO,
+                                    kAudioUnitManufacturer_Apple, 0, 0};
+  AudioComponent comp = AudioComponentFindNext(NULL, &desc);
+  AudioComponentInstance unit = NULL;
+  OSStatus e = comp ? AudioComponentInstanceNew(comp, &unit) : -1;
+  UInt32 on = 1, sz;
+  if (e == noErr) e = AudioUnitSetProperty(unit, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Input, 1, &on, sizeof(on));
+  if (e == noErr) e = AudioUnitSetProperty(unit, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Output, 0, &on, sizeof(on));
+  AudioStreamBasicDescription hw_out = {0};
+  if (e == noErr) {
+    sz = sizeof(hw_out);
+    if (AudioUnitGetProperty(unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 0, &hw_out, &sz) != noErr ||
+        hw_out.mSampleRate < 8000.0 || hw_out.mSampleRate > 192000.0) {
+      hw_out.mSampleRate = 48000.0;
+    }
+  }
+  uint32_t rate = (uint32_t)llround(hw_out.mSampleRate);
+  if (e == noErr) {
+    AudioStreamBasicDescription f_play = {0};
+    f_play.mSampleRate = rate;
+    f_play.mFormatID = kAudioFormatLinearPCM;
+    f_play.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
+    f_play.mFramesPerPacket = 1;
+    f_play.mChannelsPerFrame = 2;
+    f_play.mBitsPerChannel = 32;
+    f_play.mBytesPerFrame = f_play.mBytesPerPacket = 8;
+    e = AudioUnitSetProperty(unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0, &f_play, sizeof(f_play));
+  }
+  if (e == noErr) {
+    AudioStreamBasicDescription f_cap = {0};
+    f_cap.mSampleRate = rate;
+    f_cap.mFormatID = kAudioFormatLinearPCM;
+    f_cap.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
+    f_cap.mFramesPerPacket = 1;
+    f_cap.mChannelsPerFrame = 1;
+    f_cap.mBitsPerChannel = 32;
+    f_cap.mBytesPerFrame = f_cap.mBytesPerPacket = 4;
+    e = AudioUnitSetProperty(unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 1, &f_cap, sizeof(f_cap));
+  }
+  if (e == noErr) {
+    UInt32 bypass = 0, agc = 1;
+    AudioUnitSetProperty(unit, kAUVoiceIOProperty_BypassVoiceProcessing, kAudioUnitScope_Global, 0, &bypass, sizeof(bypass));
+    AudioUnitSetProperty(unit, kAUVoiceIOProperty_VoiceProcessingEnableAGC, kAudioUnitScope_Global, 0, &agc, sizeof(agc));
+    if (@available(macOS 14.0, *)) {
+      AUVoiceIOOtherAudioDuckingConfiguration duck = {false, kAUVoiceIOOtherAudioDuckingLevelMin};
+      AudioUnitSetProperty(unit, kAUVoiceIOProperty_OtherAudioDuckingConfiguration, kAudioUnitScope_Global, 0, &duck, sizeof(duck));
+    }
+    AURenderCallbackStruct rcb = {vpio_render, NULL};
+    e = AudioUnitSetProperty(unit, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input, 0, &rcb, sizeof(rcb));
+  }
+  if (e == noErr) {
+    AURenderCallbackStruct icb = {vpio_capture, NULL};
+    e = AudioUnitSetProperty(unit, kAudioOutputUnitProperty_SetInputCallback, kAudioUnitScope_Global, 0, &icb, sizeof(icb));
+  }
+  if (e == noErr) e = AudioUnitInitialize(unit);
+  if (e != noErr) {
+    if (unit) AudioComponentInstanceDispose(unit);
+    LOG("VoiceProcessingIO setup failed (%d); falling back to standard CoreAudio", (int)e);
+    return e;
+  }
+  g_vpio.rate = rate;
+  g_vpio.scratch_frames = WSD_VPIO_MAX_FRAMES;
+  g_vpio.in_scratch = calloc(WSD_VPIO_MAX_FRAMES, sizeof(float));
+  g_vpio.mix_scratch = calloc((size_t)WSD_VPIO_MAX_FRAMES * 2, sizeof(float));
+  g_vpio.unit = unit;
+  LOG("VoiceProcessingIO active (%u Hz, stereo playback AEC reference + mono mic)", rate);
+  return noErr;
+}
+
+/* On g_audio_queue: dispose the shared VoiceProcessingIO unit once no streams remain attached. */
+static void vpio_maybe_dispose(void) {
+  if (g_vpio.attached > 0 || !g_vpio.unit) return;
+  AudioOutputUnitStop(g_vpio.unit);
+  AudioUnitUninitialize(g_vpio.unit);
+  AudioComponentInstanceDispose(g_vpio.unit);
+  g_vpio.unit = NULL;
+  g_vpio.started = 0;
+  free(g_vpio.in_scratch);
+  free(g_vpio.mix_scratch);
+  g_vpio.in_scratch = NULL;
+  g_vpio.mix_scratch = NULL;
+}
+
+static int vpio_slot_attach(struct wsd_vpio_slot *slots, struct wsd_audio_rt *rt) {
+  for (int i = 0; i < WSD_VPIO_MAX_SLOTS; i++) {
+    if (atomic_load_explicit(&slots[i].rt, memory_order_relaxed) == NULL) {
+      atomic_store_explicit(&slots[i].rt, rt, memory_order_release);
+      atomic_store_explicit(&slots[i].active, 1, memory_order_release);
+      return i;
+    }
+  }
+  return -1;
+}
+
+static void vpio_slot_detach(struct wsd_vpio_slot *slots, int idx) {
+  if (idx < 0 || idx >= WSD_VPIO_MAX_SLOTS) return;
+  atomic_store_explicit(&slots[idx].active, 0, memory_order_release);
+  while (atomic_load_explicit(&slots[idx].busy, memory_order_acquire) > 0) usleep(100);
+  atomic_store_explicit(&slots[idx].rt, NULL, memory_order_release);
 }
 
 /* CoreAudio calls can block: AudioOutputUnitStop waits out the render thread. On the main queue they held frames and
@@ -379,10 +637,100 @@ static dispatch_queue_t g_audio_queue;
 @property size_t mapLen;
 @property struct wsd_audio_rt *rt;
 @property BOOL input; /* the server writes the ring and the client reads it */
+@property BOOL vpio;
+@property BOOL vpioStarted;
+@property int vpioSlot;
 @end
 @implementation WsdAudio
+/* On g_audio_queue: attach an output stream to the shared VoiceProcessingIO hub (Bus 0 stereo AEC reference). */
+- (OSStatus)setUpVpioOutput:(struct wsd_audio_open)o sample:(uint32_t)sample {
+  OSStatus e = vpio_ensure();
+  if (e != noErr) return e;
+  AudioStreamBasicDescription src = {0};
+  src.mSampleRate = o.rate;
+  src.mFormatID = kAudioFormatLinearPCM;
+  src.mFormatFlags = kAudioFormatFlagIsPacked |
+                     (o.format == WSD_AUDIO_F32 ? kAudioFormatFlagIsFloat
+                      : o.format == WSD_AUDIO_U8 ? 0 : kAudioFormatFlagIsSignedInteger);
+  src.mFramesPerPacket = 1;
+  src.mChannelsPerFrame = o.channels;
+  src.mBitsPerChannel = sample * 8;
+  src.mBytesPerFrame = src.mBytesPerPacket = o.frame_bytes;
+  if (!(o.format == WSD_AUDIO_F32 && o.channels == 2 && o.rate == g_vpio.rate)) {
+    AudioStreamBasicDescription dst = {0};
+    dst.mSampleRate = g_vpio.rate;
+    dst.mFormatID = kAudioFormatLinearPCM;
+    dst.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
+    dst.mFramesPerPacket = 1;
+    dst.mChannelsPerFrame = 2;
+    dst.mBitsPerChannel = 32;
+    dst.mBytesPerFrame = dst.mBytesPerPacket = 8;
+    e = AudioConverterNew(&src, &dst, &self.rt->conv);
+    if (e == noErr && o.channels == 1) {
+      SInt32 chmap[2] = {0, 0};
+      AudioConverterSetProperty(self.rt->conv, kAudioConverterChannelMap, sizeof(chmap), chmap);
+    }
+    if (e != noErr) { vpio_maybe_dispose(); return e; }
+    self.rt->out_frames = (uint32_t)ceil((double)WSD_VPIO_MAX_FRAMES * o.rate / g_vpio.rate) + 128;
+    self.rt->out = calloc(self.rt->out_frames, o.frame_bytes);
+  }
+  int slot = vpio_slot_attach(g_vpio.out_slots, self.rt);
+  if (slot < 0) {
+    if (self.rt->conv) { AudioConverterDispose(self.rt->conv); self.rt->conv = NULL; }
+    vpio_maybe_dispose();
+    return -1;
+  }
+  self.vpio = YES;
+  self.vpioSlot = slot;
+  g_vpio.attached++;
+  return noErr;
+}
+/* On g_audio_queue: attach an input stream to the shared VoiceProcessingIO hub (Bus 1 AEC + Voice Isolation mic). */
+- (OSStatus)setUpVpioInput:(struct wsd_audio_open)o {
+  OSStatus e = vpio_ensure();
+  if (e != noErr) return e;
+  AudioStreamBasicDescription dst = {0};
+  dst.mSampleRate = o.rate;
+  dst.mFormatID = kAudioFormatLinearPCM;
+  dst.mFormatFlags = kAudioFormatFlagIsPacked |
+                     (o.format == WSD_AUDIO_F32 ? kAudioFormatFlagIsFloat
+                      : o.format == WSD_AUDIO_U8 ? 0 : kAudioFormatFlagIsSignedInteger);
+  dst.mFramesPerPacket = 1;
+  dst.mChannelsPerFrame = o.channels;
+  dst.mBitsPerChannel = o.frame_bytes / o.channels * 8;
+  dst.mBytesPerFrame = dst.mBytesPerPacket = o.frame_bytes;
+  if (!(o.format == WSD_AUDIO_F32 && o.channels == 1 && o.rate == g_vpio.rate)) {
+    AudioStreamBasicDescription src = {0};
+    src.mSampleRate = g_vpio.rate;
+    src.mFormatID = kAudioFormatLinearPCM;
+    src.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
+    src.mFramesPerPacket = 1;
+    src.mChannelsPerFrame = 1;
+    src.mBitsPerChannel = 32;
+    src.mBytesPerFrame = src.mBytesPerPacket = 4;
+    e = AudioConverterNew(&src, &dst, &self.rt->conv);
+    if (e == noErr && o.channels > 1) {
+      SInt32 chmap[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+      AudioConverterSetProperty(self.rt->conv, kAudioConverterChannelMap, o.channels * (UInt32)sizeof(SInt32), chmap);
+    }
+    if (e != noErr) { vpio_maybe_dispose(); return e; }
+    self.rt->out_frames = (uint32_t)ceil((double)WSD_VPIO_MAX_FRAMES * o.rate / g_vpio.rate) + 64;
+    self.rt->out = calloc(self.rt->out_frames, o.frame_bytes);
+  }
+  int slot = vpio_slot_attach(g_vpio.in_slots, self.rt);
+  if (slot < 0) {
+    if (self.rt->conv) { AudioConverterDispose(self.rt->conv); self.rt->conv = NULL; }
+    vpio_maybe_dispose();
+    return -1;
+  }
+  self.vpio = YES;
+  self.vpioSlot = slot;
+  g_vpio.attached++;
+  return noErr;
+}
 /* On g_audio_queue: a default-output unit that plays the ring in the client's format. */
 - (OSStatus)setUp:(struct wsd_audio_open)o sample:(uint32_t)sample {
+  if (g_voice_processing && [self setUpVpioOutput:o sample:sample] == noErr) return noErr;
   AudioComponentDescription desc = {kAudioUnitType_Output, kAudioUnitSubType_DefaultOutput,
                                     kAudioUnitManufacturer_Apple, 0, 0};
   AudioComponent comp = AudioComponentFindNext(NULL, &desc);
@@ -412,6 +760,7 @@ static dispatch_queue_t g_audio_queue;
 }
 /* On g_audio_queue: an AUHAL unit that captures the default input device in the client's rate. */
 - (OSStatus)setUpInput:(struct wsd_audio_open)o {
+  if (g_voice_processing && [self setUpVpioInput:o] == noErr) return noErr;
   AudioComponentDescription desc = {kAudioUnitType_Output, kAudioUnitSubType_HALOutput, kAudioUnitManufacturer_Apple,
                                     0, 0};
   AudioComponent comp = AudioComponentFindNext(NULL, &desc);
@@ -478,7 +827,48 @@ static dispatch_queue_t g_audio_queue;
   return e;
 }
 /* On g_audio_queue. */
+- (OSStatus)startUnit {
+  if (self.vpio) {
+    if (!g_vpio.unit) return noErr;
+    if (!self.vpioStarted) {
+      self.vpioStarted = YES;
+      if (++g_vpio.started == 1) {
+        OSStatus e = AudioOutputUnitStart(g_vpio.unit);
+        if (e != noErr) { self.vpioStarted = NO; g_vpio.started--; }
+        return e;
+      }
+    }
+    return noErr;
+  }
+  if (!self.unit) return noErr; /* its setup failed: the client gets that error */
+  return AudioOutputUnitStart(self.unit);
+}
+/* On g_audio_queue. */
+- (void)stopUnit {
+  if (self.vpio) {
+    if (self.vpioStarted) {
+      self.vpioStarted = NO;
+      if (--g_vpio.started == 0 && g_vpio.unit) AudioOutputUnitStop(g_vpio.unit);
+    }
+    return;
+  }
+  if (self.unit) AudioOutputUnitStop(self.unit);
+}
+/* On g_audio_queue. */
 - (void)teardown {
+  if (self.vpio) {
+    vpio_slot_detach(self.input ? g_vpio.in_slots : g_vpio.out_slots, self.vpioSlot);
+    self.vpioSlot = -1;
+    if (self.vpioStarted) {
+      self.vpioStarted = NO;
+      if (--g_vpio.started == 0 && g_vpio.unit) AudioOutputUnitStop(g_vpio.unit);
+    }
+    if (self.rt->conv) { AudioConverterDispose(self.rt->conv); self.rt->conv = NULL; }
+    self.vpio = NO;
+    if (g_vpio.attached > 0) g_vpio.attached--;
+    vpio_maybe_dispose();
+    return;
+  }
   if (!self.unit) return;
   AudioOutputUnitStop(self.unit); /* synchronous: the render callback is not running afterwards */
   AudioUnitUninitialize(self.unit);
@@ -2260,8 +2650,7 @@ static void maybe_apply_app_icon(WsdClient *client) {
       pid_t pid = self.pid;
       __weak WsdClient *weakSelf = self;
       dispatch_async(g_audio_queue, ^{
-        if (!a.unit) return; /* its setup failed: the client gets that error */
-        OSStatus e = AudioOutputUnitStart(a.unit);
+        OSStatus e = [a startUnit];
         if (e == noErr) return;
         LOG("client %d: audio stream %u: start failed (%d)", pid, stream, (int)e);
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -2272,9 +2661,7 @@ static void maybe_apply_app_icon(WsdClient *client) {
     } else if (type == WSD_AUDIO_STOP) {
       atomic_store_explicit(&a.rt->running, 0, memory_order_release); /* silence from the next render on */
       audio_clock_leave(a);
-      dispatch_async(g_audio_queue, ^{
-        if (a.unit) AudioOutputUnitStop(a.unit);
-      });
+      dispatch_async(g_audio_queue, ^{ [a stopUnit]; });
     } else if (type == WSD_AUDIO_RESET) {
       if (a.input) { [self error:type code:-EINVAL]; break; } /* the client reads the ring: it resets it itself */
       _Atomic uint64_t *wp = (_Atomic uint64_t *)&a.rt->ring->write_frames;
@@ -2865,7 +3252,7 @@ static int parse_render_percent(const char *arg) {
 int main(int argc, char **argv) {
   @autoreleasepool {
     const char *dir = NULL, *render_percent = NULL;
-    int spatial_cli = -1, framegen_cli = -1;
+    int spatial_cli = -1, framegen_cli = -1, voice_cli = -1;
     for (int i = 1; i < argc; i++) {
       if (!strcmp(argv[i], "--dir") && i + 1 < argc) dir = argv[++i];
       else if (!strcmp(argv[i], "--exit-on-disconnect")) g_exit_on_disconnect = YES;
@@ -2873,11 +3260,13 @@ int main(int argc, char **argv) {
       else if (!strcmp(argv[i], "--no-metalfx-spatial")) spatial_cli = 0;
       else if (!strcmp(argv[i], "--metalfx-framegen")) framegen_cli = 1;
       else if (!strcmp(argv[i], "--no-metalfx-framegen")) framegen_cli = 0;
+      else if (!strcmp(argv[i], "--voice-processing")) voice_cli = 1;
+      else if (!strcmp(argv[i], "--no-voice-processing")) voice_cli = 0;
       else if (!strcmp(argv[i], "--render-percent")) /* a following option is not its value */
         render_percent = i + 1 < argc && strncmp(argv[i + 1], "--", 2) ? argv[++i] : "(no value)";
     }
     if (!dir) {
-      fprintf(stderr, "usage: wsd --dir <private-dir> [--exit-on-disconnect] [--render-percent N] [--metalfx-spatial] [--metalfx-framegen]\n");
+      fprintf(stderr, "usage: wsd --dir <private-dir> [--exit-on-disconnect] [--render-percent N] [--metalfx-spatial] [--metalfx-framegen] [--voice-processing]\n");
       return 2;
     }
     setvbuf(stderr, NULL, _IOLBF, 0);
@@ -2907,6 +3296,14 @@ int main(int argc, char **argv) {
         g_frame_gen = g_dev && [MTLFXFrameInterpolatorDescriptor supportsDevice:g_dev];
       }
       LOG("MetalFX FrameGen %s", g_frame_gen ? "enabled (2x color-only optical flow)" : "unsupported on this OS/GPU");
+    }
+    BOOL want_voice = [preferences boolForKey:@"WsdVoiceProcessing"];
+    const char *voice_env = getenv("WSD_VOICE_PROCESSING");
+    if (voice_env && *voice_env) want_voice = strcmp(voice_env, "0") != 0;
+    if (voice_cli >= 0) want_voice = voice_cli != 0;
+    if (want_voice) {
+      g_voice_processing = YES;
+      LOG("VoiceProcessingIO enabled (echo cancellation + Voice Isolation mic mode)");
     }
     if (g_render_fraction != g_render_percent / 100.0)
       LOG("per-application guest render fraction %.6f", g_render_fraction);

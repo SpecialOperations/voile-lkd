@@ -1,8 +1,8 @@
 #!/bin/bash
 # Install the MetalFX-enabled Linux engine binaries and stability fixes into Obelisk's Voile
 # development runtime (Voile/current):
-#   1. wsd            (MetalFX Spatial + 2x FrameGen + deferred Dock icon guard)
-#   2. fexdarwin-run  (FEXCore push/pop/ret boundary fix #25 + LKD detached ptrace SIGSTOP guard)
+#   1. wsd            (MetalFX Spatial + 2x FrameGen + Mic Voice Isolation + deferred Dock icon guard)
+#   2. fexdarwin-run  (FEXCore push/pop/ret boundary fix #25 + LKD ptrace SIGSTOP race fix)
 #   3. Neptune server (512 MiB resource upload cap, when Voile runtime matches Neptune 265be8a/be783d9)
 #   4. Wine 11.0 mf.dll audio_renderer_stream_Flush null-client patch (idempotent)
 #
@@ -126,12 +126,13 @@ echo ""
 echo "Done! Active runtime updated at:"
 echo "  $VOILE_ROOT/current"
 echo ""
-echo "If you use the SpecialOperations/Obelisk fork, toggle MetalFX Spatial and MetalFX Frame Generation"
-echo "directly in each game's Launch Settings."
+echo "If you use the SpecialOperations/Obelisk fork, toggle MetalFX Spatial, MetalFX Frame Generation,"
+echo "and Mic Voice Isolation directly in each game's Launch Settings."
 echo ""
 echo "If you use stock Obelisk, you can also enable them per game via defaults:"
 echo "  defaults write com.zagrios.obelisk.game.<GameName> WsdMetalFXSpatial -bool YES"
 echo "  defaults write com.zagrios.obelisk.game.<GameName> WsdMetalFXFrameGen -bool YES"
+echo "  defaults write com.zagrios.obelisk.game.<GameName> WsdVoiceProcessing -bool YES"
 echo ""
 echo "To revert to the stock Voile runtime at any time:"
 echo "  rm -rf \"$VOILE_ROOT/current\""
