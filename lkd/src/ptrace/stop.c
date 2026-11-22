@@ -428,7 +428,11 @@ int lkd_ptrace_signal_stop(lkd_task *t, int signo, struct lx_siginfo *info)
     struct pt_resume rs;
     int r = pt_do_stop(t, &q, &rs);
     if (r < 0) return -1;
-    if (r == 0) return signo;
+    if (r == 0) {
+        /* Tracer detached or vanished before the stop: drop synthetic PTRACE_ATTACH SIGSTOP. */
+        if (signo == LX_SIGSTOP && info && info->si_code == LX_SI_KERNEL) return 0;
+        return signo;
+    }
     if (rs.si_changed) *info = rs.si;
     return rs.sig;
 }

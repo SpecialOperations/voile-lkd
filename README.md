@@ -13,6 +13,12 @@
   - Uses `MTLFXFrameInterpolator` in pure color-only optical-flow mode (no game depth/motion-vector hooks needed) with a private 2-slot history ring so guest swapchain buffers release immediately.
   - Interpolates at the guest render resolution and chains into MetalFX Spatial when both are enabled, pacing generated and real frames across the `CADisplayLink` refresh grid.
   - Automatically bypasses interpolation at native display refresh or across pauses over 250 ms.
+- **Additional stability fixes bundled in this fork & release installer:**
+  - **`wsd` Dock icon deferral:** Defers `WSD_APP_ICON` from windowless background helper processes (such as `yt-dlp.exe`) until a client shows a window or creates an overlay, so splash screens transition cleanly to the game icon while helpers never hijack it.
+  - **`fexdarwin-run` FEXCore push/pop/ret boundary fix ([Zagrios/voile-lkd#25](https://github.com/Zagrios/voile-lkd/issues/25)):** Prevents FEX's post-RA pass from merging `OP_PUSH`/`OP_POP` (including `pop reg; ret`) across guest instruction boundaries, fixing `NoExec instruction in entry block` crashes when Unity/Wine suspends threads ([patch](tools/patches/fex-no-cross-opcode-push-pop-merge.patch)).
+  - **`lkd` ptrace detached `SIGSTOP` guard:** Drops a synthetic `PTRACE_ATTACH` `SIGSTOP` if the tracer has already detached, preventing an orphaned Linux group stop from hanging all threads.
+  - **Neptune 512 MiB resource upload cap:** Raises `NPT_MAX_RESOURCE_UPDATE_BYTES` from 64 MiB to 512 MiB so large Unity texture/buffer uploads don't trigger `DXGI_ERROR_DEVICE_REMOVED` ([patch](tools/patches/neptune-512mib-resource-update-cap.patch)).
+  - **Wine 11.0 `mf.dll` `audio_renderer_stream_Flush` null-client guard:** Idempotent binary patch ([tools/patch-wine-mf-sar-flush.py](tools/patch-wine-mf-sar-flush.py)) backporting Wine 11.19's null check before `IAudioClient_Reset` to stop AVProVideo MediaFoundation flush crashes.
 
 ### Quick install (prebuilt release)
 

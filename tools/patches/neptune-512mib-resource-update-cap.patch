@@ -1,0 +1,22 @@
+commit 246900f17ae8f5365519e3318b467a5f1d292ce5
+Author: Ethan Bahr <dailybantam@gmail.com>
+Date:   Sat Nov 21 17:37:22 2026 -0500
+
+    neptune: raise NPT_MAX_RESOURCE_UPDATE_BYTES cap from 64 MiB to 512 MiB
+
+diff --git a/virglrenderer/src/neptune/npt_resource.h b/virglrenderer/src/neptune/npt_resource.h
+index b3dc63c..ea403e7 100644
+--- a/virglrenderer/src/neptune/npt_resource.h
++++ b/virglrenderer/src/neptune/npt_resource.h
+@@ -20,8 +20,9 @@ struct npt_resource;
+ 
+ /* Hard cap on per-call payload byte_size.  Bounded so the byte_size+7
+  * alignment math can't wrap to 0 on a hostile value and read stale
+- * bytes. */
+-#define NPT_MAX_RESOURCE_UPDATE_BYTES (64u << 20)
++ * bytes, while still accommodating large single-subresource uploads
++ * (e.g. uncompressed/large Unity texture & buffer updates > 64 MiB). */
++#define NPT_MAX_RESOURCE_UPDATE_BYTES (512u << 20)
+ 
+ /* RESOURCE_UPDATE.  `payload` points at the contiguous source bytes in
+  * the decoder's stream; lifetime is the caller's responsibility. */

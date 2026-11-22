@@ -340,6 +340,8 @@ int lkd_signal_next(lkd_task *t)
             enum lx_sig_default d = sig == LX_SIGKILL ? LX_SIGDFL_TERM : lx_sig_default_action(sig);
             if (d == LX_SIGDFL_IGN || d == LX_SIGDFL_CONT) { sig_unlock(sp); continue; }
             if (d == LX_SIGDFL_STOP) {
+                lkd_log("pid %d tid %d: group stop on sig %d (si_code=%d sender=%d)",
+                        t->proc->pid, t->tid, sig, info.si_code, info.u.kill.pid);
                 struct sig_wakeset ws = { 0 };
                 initiate_stop(t, sp, sig, &ws);
                 sig_unlock(sp);
