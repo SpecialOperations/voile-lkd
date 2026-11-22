@@ -201,12 +201,7 @@ int pt_tid_alive(int32_t tid)
 
 static int wake_local(lkd_task *t, unsigned how)
 {
-    if (how & PT_WAKE_SYNC) {
-        uint32_t had = atomic_load(&t->ptrace.flags) & LKD_PT_TRACED;
-        pt_sync_flags(t);
-        if (had && !(atomic_load(&t->ptrace.flags) & LKD_PT_TRACED))
-            lkd_sig_discard_attach_sigstop(t);
-    }
+    if (how & PT_WAKE_SYNC) pt_sync_flags(t);
     if (how & PT_WAKE_TRAP) atomic_fetch_or(&t->flags, LKD_TF_TRACE_STOP);
     lkd_task_wake(t);
     if ((how & PT_WAKE_KICK) && lkd_engine() && lkd_engine()->kick) lkd_engine()->kick(t);

@@ -127,6 +127,8 @@ int sig_next_signal(uint64_t bits);
 int sig_generate_locked(lkd_task *target, struct lkd_sigproc *sp, int sig, const struct lx_siginfo *info,
                         int thread_directed, struct sig_wakeset *ws);
 /* Dequeue one signal of `allowed` from t's queue then the process queue. Returns signo or 0. */
+int sig_dequeue_from_locked(lkd_task *t, struct lkd_sigproc *sp, uint64_t allowed, struct lx_siginfo *info,
+                            int *thread_directed);
 int sig_dequeue_locked(lkd_task *t, struct lkd_sigproc *sp, uint64_t allowed, struct lx_siginfo *info);
 /* Peek without dequeuing: next signo of allowed (thread first), 0 if none; skip excludes signals. */
 int sig_peek_locked(lkd_task *t, struct lkd_sigproc *sp, uint64_t allowed);

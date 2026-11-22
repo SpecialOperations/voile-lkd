@@ -320,10 +320,7 @@ int pt_do_stop(lkd_task *t, const struct pt_stop_req *rq, struct pt_resume *out)
     apply_resume(t, L, out, nfx, fx_dirty, nxs, nxlen, xs_dirty, newmask, mask_dirty);
     free(nfx);
     free(nxs);
-    if (out->detached) {
-        L->slot = -1;
-        lkd_sig_discard_attach_sigstop(t);
-    }
+    if (out->detached) L->slot = -1;
     pt_sync_flags(t);
     lkd_registry_publish(t);
     return 1;
@@ -421,11 +418,12 @@ void lkd_ptrace_syscall_exit_replaced(lkd_task *t)
 
 int lkd_ptrace_signal_stop(lkd_task *t, int signo, struct lx_siginfo *info)
 {
+    int attach_stop = (signo == LX_SIGSTOP && info && info->si_code == LX_SI_KERNEL && info->u.kill.pid == 0);
     if (!(atomic_load(&t->ptrace.flags) & LKD_PT_TRACED)) {
-        if (signo == LX_SIGSTOP && info && info->si_code == LX_SI_KERNEL && pt_my_slot(t) >= 0) {
+        if (attach_stop && pt_my_slot(t) >= 0) {
             pt_sync_flags(t);
         } else {
-            return signo;
+            return attach_stop ? 0 : signo;
         }
     }
     struct pt_stop_req q;
@@ -439,7 +437,7 @@ int lkd_ptrace_signal_stop(lkd_task *t, int signo, struct lx_siginfo *info)
     if (r < 0) return -1;
     if (r == 0) {
         /* Tracer detached or vanished before the stop: drop synthetic PTRACE_ATTACH SIGSTOP. */
-        if (signo == LX_SIGSTOP && info && info->si_code == LX_SI_KERNEL) return 0;
+        if (attach_stop) return 0;
         return signo;
     }
     if (rs.si_changed) *info = rs.si;

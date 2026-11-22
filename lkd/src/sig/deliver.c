@@ -287,7 +287,8 @@ int lkd_signal_next(lkd_task *t)
             continue;
         }
         struct lx_siginfo info;
-        int sig = sig_dequeue_locked(t, sp, ~atomic_load(&t->sigmask), &info);
+        int from_tid = 0;
+        int sig = sig_dequeue_from_locked(t, sp, ~atomic_load(&t->sigmask), &info, &from_tid);
         if (!sig) {
             if (t->restore_sigmask) {
                 /* Nothing was delivered: the temporary mask of sigsuspend/ppoll/pselect ends here. */
@@ -305,8 +306,10 @@ int lkd_signal_next(lkd_task *t)
         sig_recalc_locked(t, sp);
         sig_unlock(sp);
 
+        int ptrace_attach_stop = (sig == LX_SIGSTOP && from_tid &&
+                                  info.si_code == LX_SI_KERNEL && info.u.kill.pid == 0);
         if (((atomic_load(&t->ptrace.flags) & LKD_PT_TRACED) ||
-             (sig == LX_SIGSTOP && info.si_code == LX_SI_KERNEL && lkd_ptrace_tracer_of(t->tid) != 0)) &&
+             (ptrace_attach_stop && lkd_ptrace_tracer_of(t->tid) != 0)) &&
             sig != LX_SIGKILL) {
             int ns = lkd_ptrace_signal_stop(t, sig, &info);
             if (ns < 0) { atomic_fetch_or(&t->flags, LKD_TF_FATAL); return die(t); }
@@ -326,6 +329,10 @@ int lkd_signal_next(lkd_task *t)
                 sig_send_task_full(t, sig, &info, 1, 0);
                 continue;
             }
+        } else if (ptrace_attach_stop) {
+            /* Synthetic PTRACE_ATTACH SIGSTOP whose tracer already detached before delivery:
+             * drop it instead of initiating a process-wide job-control group stop. */
+            continue;
         }
 
         sig_lock(sp);

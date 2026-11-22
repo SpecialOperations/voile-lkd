@@ -234,7 +234,8 @@ int sig_generate_locked(lkd_task *target, struct lkd_sigproc *sp, int sig, const
     return 0;
 }
 
-int sig_dequeue_locked(lkd_task *t, struct lkd_sigproc *sp, uint64_t allowed, struct lx_siginfo *info)
+int sig_dequeue_from_locked(lkd_task *t, struct lkd_sigproc *sp, uint64_t allowed, struct lx_siginfo *info,
+                            int *thread_directed)
 {
     struct sig_task *st = sig_task_of(t);
     uint64_t b = atomic_load(&t->pending.bits) & allowed;
@@ -242,6 +243,7 @@ int sig_dequeue_locked(lkd_task *t, struct lkd_sigproc *sp, uint64_t allowed, st
         int s = sig_next_signal(b);
         int more = sq_collect(&st->q, s, info, &sp->queued);
         if (!more) atomic_fetch_and(&t->pending.bits, ~LX_SIGBIT(s));
+        if (thread_directed) *thread_directed = 1;
         return s;
     }
     b = atomic_load(&sp->shared_bits) & allowed;
@@ -249,9 +251,16 @@ int sig_dequeue_locked(lkd_task *t, struct lkd_sigproc *sp, uint64_t allowed, st
         int s = sig_next_signal(b);
         int more = sq_collect(&sp->shared_q, s, info, &sp->queued);
         if (!more) atomic_fetch_and(&sp->shared_bits, ~LX_SIGBIT(s));
+        if (thread_directed) *thread_directed = 0;
         return s;
     }
+    if (thread_directed) *thread_directed = 0;
     return 0;
+}
+
+int sig_dequeue_locked(lkd_task *t, struct lkd_sigproc *sp, uint64_t allowed, struct lx_siginfo *info)
+{
+    return sig_dequeue_from_locked(t, sp, allowed, info, NULL);
 }
 
 int sig_peek_locked(lkd_task *t, struct lkd_sigproc *sp, uint64_t allowed)
@@ -317,34 +326,4 @@ void sig_send_task_full(lkd_task *target, int sig, const struct lx_siginfo *info
 void lkd_sig_send_task(lkd_task *target, int signo, const struct lx_siginfo *info, int thread_directed)
 {
     sig_send_task_full(target, signo, info, thread_directed, 0);
-}
-
-void lkd_sig_discard_attach_sigstop(lkd_task *t)
-{
-    if (!t || !t->proc) return;
-    struct lkd_sigproc *sp = sig_proc(t->proc);
-    struct sig_task *st = sig_task_of(t);
-    sig_lock(sp);
-    if (atomic_load(&t->pending.bits) & LX_SIGBIT(LX_SIGSTOP)) {
-        struct sq_node **pp = &st->q.head;
-        int more = 0, removed = 0;
-        while (*pp) {
-            struct sq_node *n = *pp;
-            if (n->info.si_signo == LX_SIGSTOP) {
-                if (!removed && n->info.si_code == LX_SI_KERNEL && n->info.u.kill.pid == 0) {
-                    *pp = n->next;
-                    free(n);
-                    if (sp->queued) sp->queued--;
-                    removed = 1;
-                    continue;
-                }
-                more = 1;
-            }
-            pp = &n->next;
-        }
-        st->q.tail = pp;
-        if (removed && !more) atomic_fetch_and(&t->pending.bits, ~LX_SIGBIT(LX_SIGSTOP));
-        sig_recalc_locked(t, sp);
-    }
-    sig_unlock(sp);
 }
