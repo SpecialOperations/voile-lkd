@@ -1,10 +1,10 @@
 #!/bin/bash
-# Install the MetalFX-enabled Linux engine binaries and stability fixes into Obelisk's Voile
-# development runtime (Voile/current):
-#   1. wsd            (MetalFX Spatial + 2x FrameGen + Mic Voice Isolation + deferred Dock icon guard)
+# Install the Obelisk FX Linux engine binaries, media playback stack, clipboard sync, and stability fixes
+# into Obelisk's Voile development runtime (Voile/current):
+#   1. wsd            (MetalFX Spatial + 2x FrameGen + Mic Voice Isolation + native clipboard sync + Dock icon guard)
 #   2. fexdarwin-run  (FEXCore push/pop/ret boundary fix #25 + LKD ptrace SIGSTOP race fix)
-#   3. Neptune server (512 MiB resource upload cap, when Voile runtime matches Neptune 265be8a/be783d9)
-#   4. Wine 11.0 mf.dll audio_renderer_stream_Flush null-client patch (idempotent)
+#   3. Neptune server (512 MiB resource upload cap + same-process D3D11 shared textures / IDXGIKeyedMutex)
+#   4. Wine media + clipboard pack (Proton-GE FFmpeg 7.1 winedmo/MediaFoundation + mfplat format guard + wineobelisk.drv clipboard sync)
 #
 # Works either with a local wsd binary (`./install-metalfx-wsd.sh /path/to/wsd`) or by downloading
 # the latest prebuilt arm64 release from https://github.com/SpecialOperations/voile-lkd/releases.
@@ -100,7 +100,7 @@ if [ "${1-}" = "" ]; then
         echo "Installed fexdarwin-run -> $VOILE_ROOT/current/linux/engine/fexdarwin-run"
     fi
 
-    # 3. Install patched Neptune server (512 MiB resource upload cap) if runtime Neptune commit matches
+    # 3. Install patched Neptune server (512 MiB resource upload cap + same-process D3D11 shared textures / keyed mutex)
     neptune_sha=$(/usr/bin/python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("linux",{}).get("neptune",""))' "$VOILE_ROOT/current/runtime.json" 2>/dev/null || true)
     case "$neptune_sha" in
         265be8a*|be783d9*)
@@ -108,17 +108,41 @@ if [ "${1-}" = "" ]; then
                download_verified "$RELEASE_BASE/libvirglrenderer.1.dylib-arm64" "$RELEASE_BASE/libvirglrenderer.1.dylib-arm64.sha256" "$tmpdir/libvirglrenderer.1.dylib-arm64" 2>/dev/null; then
                 install_macho "$tmpdir/virgl_render_server-arm64" "$VOILE_ROOT/current/linux/graphics/libexec/virgl_render_server"
                 install_macho "$tmpdir/libvirglrenderer.1.dylib-arm64" "$VOILE_ROOT/current/linux/graphics/lib/libvirglrenderer.1.dylib"
-                echo "Installed Neptune 512 MiB cap server -> $VOILE_ROOT/current/linux/graphics/"
+                echo "Installed Neptune server (512 MiB cap + shared textures) -> $VOILE_ROOT/current/linux/graphics/"
             fi
             ;;
         *)
-            echo "Skipping Neptune 512 MiB server (runtime Neptune commit '$neptune_sha' differs)."
+            echo "Skipping Neptune server (runtime Neptune commit '$neptune_sha' differs)."
             ;;
     esac
 
-    # 4. Apply idempotent Wine 11.0 mf.dll audio_renderer_stream_Flush null-client patch
-    if /usr/bin/curl -fsSL "$RELEASE_BASE/patch-wine-mf-sar-flush.py" -o "$tmpdir/patch-wine-mf-sar-flush.py" 2>/dev/null; then
-        /usr/bin/python3 "$tmpdir/patch-wine-mf-sar-flush.py"
+    # 4. Install Wine Proton-GE FFmpeg 7.1 media playback DLLs + wineobelisk.drv native clipboard sync
+    wine_dir="$VOILE_ROOT/current/linux/wine"
+    if [ -d "$wine_dir/lib/wine/x86_64-windows" ] && [ -e "$VOILE_ROOT/current/linux/root/usr/lib/x86_64-linux-gnu/libavcodec.so.61" ]; then
+        echo "Downloading Wine media playback & clipboard sync pack..."
+        if download_verified "$RELEASE_BASE/wine-media-clipboard-x86_64.tar.gz" "$RELEASE_BASE/wine-media-clipboard-x86_64.tar.gz.sha256" "$tmpdir/wine-media-clipboard-x86_64.tar.gz" 2>/dev/null; then
+            mkdir -p "$tmpdir/wine-pack"
+            /usr/bin/tar -xzf "$tmpdir/wine-media-clipboard-x86_64.tar.gz" -C "$tmpdir/wine-pack"
+            /usr/bin/xattr -cr "$tmpdir/wine-pack" 2>/dev/null || true
+            /usr/bin/ditto "$tmpdir/wine-pack" "$wine_dir"
+            # Bump wine.inf mtime so Wine automatically refreshes existing prefixes (wineboot -u) on next launch.
+            /usr/bin/touch "$wine_dir/share/wine/wine.inf"
+            # Also sync updated DLLs directly into existing Linux prefixes so they take effect immediately.
+            for pfx in "$OBELISK_ROOT"/Prefixes/*-linux/prefix; do
+                [ -d "$pfx/drive_c/windows/system32" ] || continue
+                for dll in "$tmpdir/wine-pack/lib/wine/x86_64-windows"/*; do
+                    [ -f "$dll" ] && /bin/cp -f "$dll" "$pfx/drive_c/windows/system32/$(basename "$dll")"
+                done
+                if [ -d "$pfx/drive_c/windows/syswow64" ]; then
+                    for dll in "$tmpdir/wine-pack/lib/wine/i386-windows"/*; do
+                        [ -f "$dll" ] && /bin/cp -f "$dll" "$pfx/drive_c/windows/syswow64/$(basename "$dll")"
+                    done
+                fi
+            done
+            echo "Installed Wine media playback (winedmo/FFmpeg) & clipboard sync -> $wine_dir"
+        fi
+    else
+        echo "Skipping Wine media/clipboard pack (compatible Voile Wine/FFmpeg 7.1 runtime not found)."
     fi
 fi
 
@@ -126,7 +150,7 @@ echo ""
 echo "Done! Active runtime updated at:"
 echo "  $VOILE_ROOT/current"
 echo ""
-echo "If you use the SpecialOperations/Obelisk fork, toggle MetalFX Spatial, MetalFX Frame Generation,"
+echo "If you use Obelisk FX (SpecialOperations/Obelisk), toggle MetalFX Spatial, MetalFX Frame Generation,"
 echo "and Mic Voice Isolation directly in each game's Launch Settings."
 echo ""
 echo "If you use stock Obelisk, you can also enable them per game via defaults:"
