@@ -1,7 +1,7 @@
 #!/bin/bash
 # Install the Obelisk FX Linux engine binaries, media playback stack, clipboard sync, and stability fixes
 # into Obelisk's Voile development runtime (Voile/current):
-#   1. wsd            (MetalFX Spatial + 2x FrameGen + Mic Voice Isolation + native clipboard sync + Dock icon guard)
+#   1. wsd            (MetalFX Spatial + 2x FrameGen + Mic Voice Isolation + native clipboard sync + native macOS Full Screen + Dock icon guard)
 #   2. fexdarwin-run  (FEXCore push/pop/ret fix #25 + single demand-paged 512 MiB CodeBuffer + thread reaping + LKD ptrace SIGSTOP & MADV_FREE fixes)
 #   3. Neptune        (512 MiB upload cap + shared textures server + reusable map_pool slab allocator & upload_shmem shrink guest DLLs)
 #   4. Proton-RTSP 11.0 media + GStreamer/TLS/RTSP/HLS/RTMP/AV1/SRT + wineobelisk.drv native clipboard sync pack

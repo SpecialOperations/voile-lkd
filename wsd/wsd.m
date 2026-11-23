@@ -228,6 +228,7 @@ static void probe_frame(WsdBuffer *b, uint64_t client_ns, uint64_t rx_ns) {
 @property uint64_t statLastNs, statSumNs, statMaxNs, statMinNs;
 @property uint32_t statCount;
 @property BOOL relative, clip, fullscreen, transitioning;
+@property BOOL nativeFullscreen, nativeFullscreenTransition, clientFullscreen, hasSavedStyle;
 /* the generation of a hide waiting HIDE_DELAY_NS for a show that would cancel it (-hideSoon), 0 for none */
 @property uint64_t pendingHide;
 /* visible as the client sees it: on screen, and no hide waiting */
@@ -1023,7 +1024,7 @@ static void adjust_levels(BOOL active) {
   NSUInteger floating = 0;
   for (NSNumber *n in [NSWindow windowNumbersWithOptions:0]) {
     WsdWindow *w = byNumber[n];
-    if (!w) continue;
+    if (!w || w.nativeFullscreen || w.nativeFullscreenTransition) continue;
     if ([w floatsForActive:active]) [order insertObject:w atIndex:floating++];
     else [order addObject:w];
   }
@@ -1461,8 +1462,77 @@ static CAMetalLayer *make_metal_layer(void) {
   else
     LOG("window %u: frames shown again after %.1f s", self.windowId, gap / 1e9);
 }
+- (void)refreshOverlayFrame {
+  WsdWindow *o = self.overlay;
+  if (!o || !o.layer || !o.layer.superlayer || self.overlayPx.size.width <= 0 || self.overlayPx.size.height <= 0) return;
+  WsdScale s = backing_scale_xy(self.window);
+  NSSize vs = self.view.bounds.size;
+  NSRect px = self.overlayPx;
+  [CATransaction begin];
+  [CATransaction setDisableActions:YES];
+  o.layer.frame = CGRectMake(px.origin.x / s.x, vs.height - (px.origin.y + px.size.height) / s.y, px.size.width / s.x,
+                             px.size.height / s.y);
+  [CATransaction commit];
+}
 - (void)windowDidResize:(NSNotification *)n {
   if (self.transitioning) return; /* one RESIZE per fullscreen transition */
+  [self refreshOverlayFrame];
+  [self sendResize];
+  [self sendFrame];
+}
+- (void)windowWillEnterFullScreen:(NSNotification *)n {
+  self.transitioning = YES;
+  self.nativeFullscreenTransition = YES;
+  if (!self.hasSavedStyle) self.savedStyle = self.window.styleMask & ~NSWindowStyleMaskFullScreen;
+  LOG("window %u: entering macOS native fullscreen", self.windowId);
+}
+- (void)windowDidFailToEnterFullScreen:(NSWindow *)window {
+  self.nativeFullscreenTransition = NO;
+  self.transitioning = NO;
+  LOG("window %u: failed to enter macOS native fullscreen", self.windowId);
+}
+- (void)windowDidEnterFullScreen:(NSNotification *)n {
+  self.nativeFullscreen = YES;
+  self.nativeFullscreenTransition = NO;
+  self.transitioning = NO;
+  [self refreshOverlayFrame];
+  [self logState:"native-fullscreen-on"];
+  [self sendResize];
+  [self sendFrame];
+}
+- (void)windowWillExitFullScreen:(NSNotification *)n {
+  self.transitioning = YES;
+  self.nativeFullscreenTransition = YES;
+  LOG("window %u: exiting macOS native fullscreen", self.windowId);
+}
+- (void)windowDidFailToExitFullScreen:(NSWindow *)window {
+  self.nativeFullscreenTransition = NO;
+  self.transitioning = NO;
+  LOG("window %u: failed to exit macOS native fullscreen", self.windowId);
+}
+- (void)windowDidExitFullScreen:(NSNotification *)n {
+  self.nativeFullscreen = NO;
+  self.nativeFullscreenTransition = NO;
+  self.clientFullscreen = NO;
+  self.transitioning = NO;
+  if (self.hasSavedStyle) {
+    self.hasSavedStyle = NO;
+    NSWindow *w = self.window;
+    if (w.styleMask != self.savedStyle) {
+      NSRect content = [w contentRectForFrameRect:w.frame];
+      self.transitioning = YES;
+      w.styleMask = self.savedStyle;
+      [w setFrame:[w frameRectForContentRect:content] display:YES];
+      BOOL canNativeFS = (self.savedStyle & NSWindowStyleMaskTitled) && (self.savedStyle & NSWindowStyleMaskResizable);
+      w.collectionBehavior = canNativeFS ? NSWindowCollectionBehaviorFullScreenPrimary
+                                         : NSWindowCollectionBehaviorFullScreenNone;
+      [w makeFirstResponder:self.view];
+      self.transitioning = NO;
+    }
+  }
+  adjust_levels(NSApp.active);
+  [self refreshOverlayFrame];
+  [self logState:"native-fullscreen-off"];
   [self sendResize];
   [self sendFrame];
 }
@@ -1499,8 +1569,10 @@ static CAMetalLayer *make_metal_layer(void) {
  * would stay under (a fullscreen window above the menu bar), then at the level adjust_levels gives it. Without
  * activate, the key window stays where it is (Win32 SWP_NOACTIVATE, WS_EX_NOACTIVATE). */
 - (void)orderInFront:(BOOL)activate {
-  NSWindow *front = [NSApp windowWithWindowNumber:[NSWindow windowNumbersWithOptions:0].firstObject.integerValue];
-  if (front && front != self.window && front.level > self.window.level) self.window.level = front.level;
+  if (!self.nativeFullscreen && !self.nativeFullscreenTransition) {
+    NSWindow *front = [NSApp windowWithWindowNumber:[NSWindow windowNumbersWithOptions:0].firstObject.integerValue];
+    if (front && front != self.window && front.level > self.window.level) self.window.level = front.level;
+  }
   if (activate) [self.window makeKeyAndOrderFront:nil];
   [self.window orderFrontRegardless]; /* cooperative activation may leave the app inactive */
   adjust_levels(NSApp.active);
@@ -1519,11 +1591,18 @@ static CAMetalLayer *make_metal_layer(void) {
     self.topmost = !self.topmost;
     adjust_levels(NSApp.active);
   }
-  if (self.fullscreen) { self.savedStyle = mask; return; } /* applied when fullscreen ends */
+  if (self.fullscreen || self.nativeFullscreen || self.nativeFullscreenTransition) {
+    self.savedStyle = mask;
+    self.hasSavedStyle = YES;
+    return; /* applied when fullscreen ends */
+  }
   if (w.styleMask == mask) return;
   NSRect content = [w contentRectForFrameRect:w.frame];
   self.transitioning = YES;
   w.styleMask = mask;
+  BOOL canNativeFS = (mask & NSWindowStyleMaskTitled) && (mask & NSWindowStyleMaskResizable);
+  w.collectionBehavior = canNativeFS ? NSWindowCollectionBehaviorFullScreenPrimary
+                                     : NSWindowCollectionBehaviorFullScreenNone;
   [w setFrame:[w frameRectForContentRect:content] display:YES];
   [w makeFirstResponder:self.view];
   self.transitioning = NO;
@@ -2083,7 +2162,7 @@ static CAMetalLayer *make_metal_layer(void) {
 /* The scale changed from old to the effective one (a game's display mode): a window that is not fullscreen keeps its
  * size and place in pixels, which are the client's, and takes other points. */
 - (void)keepPixelsFromScale:(WsdScale)old {
-  if (self.fullscreen || self.window.miniaturized) return;
+  if (self.fullscreen || self.nativeFullscreen || self.nativeFullscreenTransition || self.window.miniaturized) return;
   NSWindow *w = self.window;
   NSRect content = [w contentRectForFrameRect:w.frame];
   double top = NSMaxY(primary_screen().frame);
@@ -2094,12 +2173,23 @@ static CAMetalLayer *make_metal_layer(void) {
 }
 
 - (void)setFullscreenMode:(BOOL)on {
+  if (self.nativeFullscreen || self.nativeFullscreenTransition) {
+    if (on) {
+      self.clientFullscreen = YES;
+      [self sendResize];
+    } else if (self.clientFullscreen) {
+      self.clientFullscreen = NO;
+      if (self.nativeFullscreen) [self.window toggleFullScreen:nil];
+    }
+    return;
+  }
   if (on == self.fullscreen) return;
   NSWindow *w = self.window;
   self.transitioning = YES;
   if (on) {
     self.savedFrame = w.frame;
     self.savedStyle = w.styleMask;
+    w.collectionBehavior = NSWindowCollectionBehaviorFullScreenNone;
     w.styleMask = NSWindowStyleMaskBorderless;
     [w setFrame:w.screen ? w.screen.frame : primary_screen().frame display:YES];
     @try {
@@ -2109,12 +2199,16 @@ static CAMetalLayer *make_metal_layer(void) {
     }
   } else {
     w.styleMask = self.savedStyle;
+    BOOL canNativeFS = (self.savedStyle & NSWindowStyleMaskTitled) && (self.savedStyle & NSWindowStyleMaskResizable);
+    w.collectionBehavior = canNativeFS ? NSWindowCollectionBehaviorFullScreenPrimary
+                                       : NSWindowCollectionBehaviorFullScreenNone;
     [w setFrame:self.savedFrame display:YES];
     NSApp.presentationOptions = NSApplicationPresentationDefault;
   }
   [w makeFirstResponder:self.view];
   self.transitioning = NO;
   self.fullscreen = on;
+  self.hasSavedStyle = NO;
   adjust_levels(NSApp.active);
   [self logState:on ? "fullscreen-on" : "fullscreen-off"];
   [self sendResize];
@@ -2320,8 +2414,12 @@ static CGPoint warp_point(WsdClient *c, int32_t x, int32_t y) {
   w.window = [[WsdNSWindow alloc] initWithContentRect:r styleMask:style backing:NSBackingStoreBuffered defer:NO];
   w.window.releasedWhenClosed = NO;
   w.window.backgroundColor = NSColor.blackColor;
-  /* the zoom button maximizes through the client (WSD_EV_ZOOM); wsd's own fullscreen is WINDOW_FULLSCREEN */
-  w.window.collectionBehavior = NSWindowCollectionBehaviorFullScreenNone;
+  /* Titled, resizable windows (e.g. VRChat) support native macOS Full Screen via the green button or Ctrl+Cmd+F
+   * (Option-clicking the green button still zooms through WSD_EV_ZOOM). Borderless/fixed windows stay non-fullscreen
+   * so game-driven WINDOW_FULLSCREEN and splash screens are unaffected. */
+  BOOL canNativeFS = (style & NSWindowStyleMaskTitled) && (style & NSWindowStyleMaskResizable);
+  w.window.collectionBehavior = canNativeFS ? NSWindowCollectionBehaviorFullScreenPrimary
+                                            : NSWindowCollectionBehaviorFullScreenNone;
   w.window.tabbingMode = NSWindowTabbingModeDisallowed;
   w.window.title = title;
   w.window.acceptsMouseMovedEvents = YES;
@@ -2923,6 +3021,10 @@ static void maybe_apply_app_icon(WsdClient *client) {
       [self error:type code:-EINVAL];
       break;
     }
+    if (w.nativeFullscreen || w.nativeFullscreenTransition) {
+      if (m->flags & WSD_FRAME_SIZE) [w sendResize];
+      break;
+    }
     [w setFramePx:m];
     break;
   }
@@ -3267,6 +3369,20 @@ static void make_menu(void) {
            keyEquivalent:@"q"];
   item.submenu = menu;
   [bar addItem:item];
+
+  NSMenu *winMenu = [[NSMenu alloc] initWithTitle:fr ? @"Fenêtre" : @"Window"];
+  NSMenuItem *winItem = [NSMenuItem new];
+  [winMenu addItemWithTitle:fr ? @"Réduire" : @"Minimize" action:@selector(performMiniaturize:) keyEquivalent:@""];
+  [winMenu addItemWithTitle:fr ? @"Réduire/agrandir" : @"Zoom" action:@selector(performZoom:) keyEquivalent:@""];
+  [winMenu addItem:NSMenuItem.separatorItem];
+  NSMenuItem *fsItem = [winMenu addItemWithTitle:fr ? @"Activer le mode plein écran" : @"Enter Full Screen"
+                                          action:@selector(toggleFullScreen:)
+                                   keyEquivalent:@"f"];
+  fsItem.keyEquivalentModifierMask = NSEventModifierFlagControl | NSEventModifierFlagCommand;
+  winItem.submenu = winMenu;
+  [bar addItem:winItem];
+  NSApp.windowsMenu = winMenu;
+
   NSApp.mainMenu = bar;
 }
 
