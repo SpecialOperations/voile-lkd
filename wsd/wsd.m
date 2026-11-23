@@ -53,6 +53,7 @@ static BOOL g_relative_global; /* CGAssociateMouseAndMouseCursorPosition(false) 
 static BOOL g_cursor_hide_wanted; /* the client asked for no cursor (WSD_CURSOR_VISIBLE 0) */
 static int g_cursor_hidden;       /* [NSCursor hide] in effect */
 static NSMutableSet *g_clients;
+static NSInteger g_clipboard_change_count = -1;
 static BOOL g_caps_told;           /* the Caps Lock state the clients were brought to (-syncCapsLock:) */
 static NSTimeInterval g_warp_time; /* uptime of the last CURSOR_WARP: the mouse moves queued before it are dropped */
 /* The jump of the last CURSOR_WARP, in points, until the first mouse move after it, zero for none: macOS reports the
@@ -977,6 +978,37 @@ static void sync_cursor(void) {
   if (!hide && g_cursor_hidden) { [NSCursor unhide]; g_cursor_hidden = 0; }
 }
 
+static NSData *current_pasteboard_utf8(void) {
+  NSString *text = [[NSPasteboard generalPasteboard] stringForType:NSPasteboardTypeString];
+  if (!text.length) return [NSData data];
+  NSData *utf8 = [text dataUsingEncoding:NSUTF8StringEncoding];
+  if (!utf8 || utf8.length <= WSD_MAX_PAYLOAD) return utf8 ?: [NSData data];
+  const uint8_t *bytes = utf8.bytes;
+  NSUInteger len = WSD_MAX_PAYLOAD;
+  while (len > 0 && (bytes[len] & 0xC0) == 0x80) len--;
+  return [NSData dataWithBytes:bytes length:len];
+}
+
+static void push_clipboard_to_client(WsdClient *client) {
+  NSPasteboard *pb = [NSPasteboard generalPasteboard];
+  g_clipboard_change_count = pb.changeCount;
+  NSData *utf8 = current_pasteboard_utf8();
+  [client send:WSD_EV_CLIPBOARD payload:utf8.length ? utf8.bytes : NULL len:(uint32_t)utf8.length extra:nil];
+}
+
+static void sync_clipboard_if_changed(BOOL force) {
+  NSPasteboard *pb = [NSPasteboard generalPasteboard];
+  NSInteger cc = pb.changeCount;
+  if (!force && cc == g_clipboard_change_count) return;
+  g_clipboard_change_count = cc;
+  if (!g_clients.count) return;
+  NSData *utf8 = current_pasteboard_utf8();
+  for (WsdClient *c in g_clients)
+    [c send:WSD_EV_CLIPBOARD payload:utf8.length ? utf8.bytes : NULL len:(uint32_t)utf8.length extra:nil];
+  LOG("clipboard: synced %lu UTF-8 bytes from macOS to %lu client(s)",
+      (unsigned long)utf8.length, (unsigned long)g_clients.count);
+}
+
 /* The levels of wsd's windows on the active Space, set as Wine's Mac driver sets them (-[WineApplicationController
  * adjustWindowLevels:]): back to front in the window server's order, each window takes the level its own state asks
  * for (-levelForActive:) and at least the level of every window behind it, so that a window in front of a fullscreen
@@ -1152,6 +1184,43 @@ static CAMetalLayer *make_metal_layer(void) {
   int64_t type = cg ? CGEventGetIntegerValueField(cg, kCGKeyboardEventKeyboardType) : 0;
   return type && KBGetLayoutType((int16_t)type) == kKeyboardISO ? WSD_KEY_ISO : 0;
 }
+- (void)sendShortcutKey:(uint32_t)vk down:(BOOL)down mods:(uint32_t)mods {
+  uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+  struct wsd_ev_key k = {self.ww.windowId, (down ? WSD_KEY_DOWN : 0) | WSD_KEY_SYNTHETIC, vk, mods, now};
+  [self.ww noteKey:vk down:down];
+  [self.ww sendEvent:WSD_EV_KEY payload:&k len:sizeof(k) extra:nil];
+}
+
+- (BOOL)performKeyEquivalent:(NSEvent *)e {
+  NSEventModifierFlags mods = e.modifierFlags & NSEventModifierFlagDeviceIndependentFlagsMask;
+  if (e.type == NSEventTypeKeyDown && mods == NSEventModifierFlagCommand) {
+    uint32_t key = 0;
+    switch (e.keyCode) {
+    case kVK_ANSI_V:
+      sync_clipboard_if_changed(NO);
+      key = kVK_ANSI_V;
+      break;
+    case kVK_ANSI_C: key = kVK_ANSI_C; break;
+    case kVK_ANSI_X: key = kVK_ANSI_X; break;
+    case kVK_ANSI_A: key = kVK_ANSI_A; break;
+    default: break;
+    }
+    if (key) {
+      if ([self.ww.heldKeys containsIndex:kVK_Command])
+        [self sendShortcutKey:kVK_Command down:NO mods:0];
+      if ([self.ww.heldKeys containsIndex:kVK_RightCommand])
+        [self sendShortcutKey:kVK_RightCommand down:NO mods:0];
+      uint32_t ctrl_mod = (uint32_t)(NSEventModifierFlagControl >> 16);
+      [self sendShortcutKey:kVK_Control down:YES mods:ctrl_mod];
+      [self sendShortcutKey:key down:YES mods:ctrl_mod];
+      [self sendShortcutKey:key down:NO mods:ctrl_mod];
+      [self sendShortcutKey:kVK_Control down:NO mods:0];
+      return YES;
+    }
+  }
+  return [super performKeyEquivalent:e];
+}
+
 - (void)key:(NSEvent *)e down:(BOOL)down {
   struct wsd_ev_key k = {self.ww.windowId,
                          (down ? WSD_KEY_DOWN : 0) | (e.isARepeat ? WSD_KEY_REPEAT : 0) | [self iso:e] | [self synth],
@@ -1344,6 +1413,7 @@ static CAMetalLayer *make_metal_layer(void) {
   [self sendEvent:WSD_EV_FOCUS payload:&f len:sizeof(f) extra:nil];
   [self pressHeldModifiers];
   [self syncCapsLock:(NSEvent.modifierFlags & NSEventModifierFlagCapsLock) != 0];
+  sync_clipboard_if_changed(NO);
 }
 - (void)windowDidResignKey:(NSNotification *)n {
   g_warp_jump = CGPointZero; /* the next moves are no longer this window's */
@@ -2540,6 +2610,7 @@ static void maybe_apply_app_icon(WsdClient *client) {
     g_display = r;
     LOG("client %d hello version %u", self.pid, m->version);
     [self send:WSD_EV_HELLO payload:&r len:sizeof(r) extra:nil];
+    push_clipboard_to_client(self);
     break;
   }
   case WSD_WINDOW_CREATE: {
@@ -2894,6 +2965,17 @@ static void maybe_apply_app_icon(WsdClient *client) {
     set_display_mode(self, m->width_px, m->height_px);
     break;
   }
+  case WSD_CLIPBOARD_SET: {
+    NSString *text = n ? [[NSString alloc] initWithBytes:d length:n encoding:NSUTF8StringEncoding] : @"";
+    if (text) {
+      NSPasteboard *pb = [NSPasteboard generalPasteboard];
+      [pb clearContents];
+      if (text.length) [pb setString:text forType:NSPasteboardTypeString];
+      g_clipboard_change_count = pb.changeCount;
+      LOG("client %d: updated macOS clipboard (%u UTF-8 bytes)", self.pid, n);
+    }
+    break;
+  }
   case WSD_CURSOR_WARP: {
     NEED(wsd_cursor_pos);
     /* SetCursorPos, only while wsd is the active app (a game behind another app must not move the user's pointer) and
@@ -3168,6 +3250,7 @@ static BOOL session_ending(void) {
   g_focus_wanted = nil;
   if (w.shown && !((WsdNSWindow *)w.window).noActivate) [w orderInFront:YES];
   adjust_levels(YES);
+  sync_clipboard_if_changed(NO);
 }
 @end
 
@@ -3402,6 +3485,14 @@ int main(int argc, char **argv) {
         for (WsdWindow *w in c.windows.allValues) [w checkStalled:now];
     });
     dispatch_resume(stall_timer);
+
+    dispatch_source_t clip_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+    dispatch_source_set_timer(clip_timer, dispatch_time(DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC),
+                              250 * NSEC_PER_MSEC, 50 * NSEC_PER_MSEC);
+    dispatch_source_set_event_handler(clip_timer, ^{
+      sync_clipboard_if_changed(NO);
+    });
+    dispatch_resume(clip_timer);
 
     LOG("listening on %s (pid %d, device %s, max %ld Hz)", path, getpid(), g_dev.name.UTF8String,
         (long)primary_screen().maximumFramesPerSecond);
