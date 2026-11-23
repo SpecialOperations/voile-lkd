@@ -1,0 +1,87 @@
+diff --git a/dlls/mfplat/sample.c b/dlls/mfplat/sample.c
+index 60d78dc..b58a453 100644
+--- a/dlls/mfplat/sample.c
++++ b/dlls/mfplat/sample.c
+@@ -1559,6 +1559,19 @@ static HRESULT sample_allocator_initialize(struct sample_allocator *allocator, u
+     if (FAILED(hr = sample_allocator_get_surface_service(allocator, &service)))
+         return hr;
+ 
++    if (service.d3d11_device)
++    {
++        UINT format_support = 0;
++
++        if (!dxgi_format || FAILED(ID3D11Device_CheckFormatSupport(service.d3d11_device, dxgi_format, &format_support))
++                || !(format_support & D3D11_FORMAT_SUPPORT_TEXTURE2D))
++        {
++            WARN("D3D11 device does not support format %u (support %#x).\n", dxgi_format, format_support);
++            sample_allocator_release_surface_service(allocator, &service);
++            return E_INVALIDARG;
++        }
++    }
++
+     sample_allocator_release_samples(allocator);
+ 
+     for (i = 0; i < sample_count; ++i)
+diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
+index e3b523e..27693f7 100644
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -2279,7 +2279,7 @@ __ASM_GLOBAL_FUNC( dump_syscall_fault_return,
+                    "movq %rdi,%rsp\n\t"
+                    "movq %rsi,%rax\n\t"
+                    "movq %rdx,%r13\n\t"
+-                   "jmp %rcx")
++                   "jmp *%rcx")
+ 
+ 
+ static void dump_syscall_fault( CONTEXT *context, DWORD exc_code )
+diff --git a/dlls/winegstreamer/unixlib.c b/dlls/winegstreamer/unixlib.c
+index 9ff4f9f..e753baa 100644
+--- a/dlls/winegstreamer/unixlib.c
++++ b/dlls/winegstreamer/unixlib.c
+@@ -269,6 +269,7 @@ static void soupmessage_constructed(GObject *object)
+     soup_message_set_force_http1(object, TRUE);
+ }
+ 
++#define LIBSOUP_SO_VERSIONED "libsoup-3.0.so.0"
+ #define LIBSOUP_SO "libsoup-3.0.so"
+ 
+ static bool hook_libsoup(void)
+@@ -278,7 +279,9 @@ static bool hook_libsoup(void)
+     GType soupmessage_type;
+     void *libsoup;
+ 
+-    libsoup = dlopen(LIBSOUP_SO, RTLD_GLOBAL | RTLD_NOW);
++    libsoup = dlopen(LIBSOUP_SO_VERSIONED, RTLD_GLOBAL | RTLD_NOW);
++    if (!libsoup)
++        libsoup = dlopen(LIBSOUP_SO, RTLD_GLOBAL | RTLD_NOW);
+     if (!libsoup)
+         return false;
+ 
+diff --git a/dlls/winegstreamer/winegstreamer.rgs b/dlls/winegstreamer/winegstreamer.rgs
+index d0c0265..f090268 100644
+--- a/dlls/winegstreamer/winegstreamer.rgs
++++ b/dlls/winegstreamer/winegstreamer.rgs
+@@ -67,6 +67,22 @@ HKLM
+                     {
+                         val '{587eeb6a-7336-4ebd-a4f2-91c948de622c}' = s 'GStreamer Scheme Handler'
+                     }
++                    'rtmp:'
++                    {
++                        val '{587eeb6a-7336-4ebd-a4f2-91c948de622c}' = s 'GStreamer Scheme Handler'
++                    }
++                    'rtmps:'
++                    {
++                        val '{587eeb6a-7336-4ebd-a4f2-91c948de622c}' = s 'GStreamer Scheme Handler'
++                    }
++                    'rtmpt:'
++                    {
++                        val '{587eeb6a-7336-4ebd-a4f2-91c948de622c}' = s 'GStreamer Scheme Handler'
++                    }
++                    'srt:'
++                    {
++                        val '{587eeb6a-7336-4ebd-a4f2-91c948de622c}' = s 'GStreamer Scheme Handler'
++                    }
+                 }
+             }
+         }

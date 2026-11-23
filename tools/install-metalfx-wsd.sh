@@ -4,7 +4,7 @@
 #   1. wsd            (MetalFX Spatial + 2x FrameGen + Mic Voice Isolation + native clipboard sync + Dock icon guard)
 #   2. fexdarwin-run  (FEXCore push/pop/ret fix #25 + single demand-paged 512 MiB CodeBuffer + thread reaping + LKD ptrace SIGSTOP & MADV_FREE fixes)
 #   3. Neptune        (512 MiB upload cap + shared textures server + reusable map_pool slab allocator & upload_shmem shrink guest DLLs)
-#   4. Wine media + clipboard pack (Proton-GE FFmpeg 7.1 winedmo/MediaFoundation + mfplat format guard + wineobelisk.drv clipboard sync)
+#   4. Proton-RTSP 11.0 media + GStreamer/TLS/RTSP/HLS/RTMP/AV1/SRT + wineobelisk.drv native clipboard sync pack
 #
 # Works either with a local wsd binary (`./install-metalfx-wsd.sh /path/to/wsd`) or by downloading
 # the latest prebuilt arm64 release from https://github.com/SpecialOperations/voile-lkd/releases.
@@ -130,10 +130,21 @@ if [ "${1-}" = "" ]; then
             ;;
     esac
 
-    # 4. Install Wine Proton-GE FFmpeg 7.1 media playback DLLs + wineobelisk.drv native clipboard sync
+    # 4. Install Proton-RTSP 11.0 media/livestream DLLs + GStreamer/libsoup/TLS root pack + wineobelisk.drv clipboard sync
     wine_dir="$VOILE_ROOT/current/linux/wine"
-    if [ -d "$wine_dir/lib/wine/x86_64-windows" ] && [ -e "$VOILE_ROOT/current/linux/root/usr/lib/x86_64-linux-gnu/libavcodec.so.61" ]; then
-        echo "Downloading Wine media playback & clipboard sync pack..."
+    root_dir="$VOILE_ROOT/current/linux/root"
+    if [ -d "$wine_dir/lib/wine/x86_64-windows" ] && [ -e "$root_dir/usr/lib/x86_64-linux-gnu/libavcodec.so.61" ]; then
+        if download_verified "$RELEASE_BASE/gst-rtsp-root-x86_64.tar.gz" "$RELEASE_BASE/gst-rtsp-root-x86_64.tar.gz.sha256" "$tmpdir/gst-rtsp-root-x86_64.tar.gz" 2>/dev/null; then
+            mkdir -p "$tmpdir/gst-root"
+            /usr/bin/tar -xzf "$tmpdir/gst-rtsp-root-x86_64.tar.gz" -C "$tmpdir/gst-root"
+            /usr/bin/xattr -cr "$tmpdir/gst-root" 2>/dev/null || true
+            /usr/bin/ditto "$tmpdir/gst-root" "$root_dir"
+            for plugin in libgstsoup.so libgstadaptivedemux2.so; do
+                [ -f "$root_dir/usr/lib/x86_64-linux-gnu/gstreamer-1.0/$plugin" ] && /usr/bin/touch "$root_dir/usr/lib/x86_64-linux-gnu/gstreamer-1.0/$plugin"
+            done
+            echo "Installed GStreamer RTSP/HLS/TS/RTMP/SRT/AV1 + libsoup/TLS runtime libs -> $root_dir"
+        fi
+        echo "Downloading Proton-RTSP 11.0 media playback & clipboard sync pack..."
         if download_verified "$RELEASE_BASE/wine-media-clipboard-x86_64.tar.gz" "$RELEASE_BASE/wine-media-clipboard-x86_64.tar.gz.sha256" "$tmpdir/wine-media-clipboard-x86_64.tar.gz" 2>/dev/null; then
             mkdir -p "$tmpdir/wine-pack"
             /usr/bin/tar -xzf "$tmpdir/wine-media-clipboard-x86_64.tar.gz" -C "$tmpdir/wine-pack"
@@ -141,8 +152,10 @@ if [ "${1-}" = "" ]; then
             /usr/bin/ditto "$tmpdir/wine-pack" "$wine_dir"
             # Bump wine.inf mtime so Wine automatically refreshes existing prefixes (wineboot -u) on next launch.
             /usr/bin/touch "$wine_dir/share/wine/wine.inf"
-            # Also sync updated DLLs directly into existing Linux prefixes so they take effect immediately.
-            for pfx in "$OBELISK_ROOT"/Prefixes/*-linux/prefix; do
+            # Also sync updated DLLs directly into existing Linux prefixes and clear stale GStreamer registry caches.
+            for pfx_dir in "$OBELISK_ROOT"/Prefixes/*-linux; do
+                rm -f "$pfx_dir/.cache/gstreamer-1.0"/registry*.bin 2>/dev/null || true
+                pfx="$pfx_dir/prefix"
                 [ -d "$pfx/drive_c/windows/system32" ] || continue
                 for dll in "$tmpdir/wine-pack/lib/wine/x86_64-windows"/*; do
                     [ -f "$dll" ] && /bin/cp -f "$dll" "$pfx/drive_c/windows/system32/$(basename "$dll")"
@@ -153,10 +166,10 @@ if [ "${1-}" = "" ]; then
                     done
                 fi
             done
-            echo "Installed Wine media playback (winedmo/FFmpeg) & clipboard sync -> $wine_dir"
+            echo "Installed Proton-RTSP 11.0 media playback & clipboard sync -> $wine_dir"
         fi
     else
-        echo "Skipping Wine media/clipboard pack (compatible Voile Wine/FFmpeg 7.1 runtime not found)."
+        echo "Skipping Wine media/clipboard pack (compatible Voile Wine/GStreamer runtime not found)."
     fi
 fi
 
