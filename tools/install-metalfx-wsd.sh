@@ -2,8 +2,8 @@
 # Install the Obelisk FX Linux engine binaries, media playback stack, clipboard sync, and stability fixes
 # into Obelisk's Voile development runtime (Voile/current):
 #   1. wsd            (MetalFX Spatial + 2x FrameGen + Mic Voice Isolation + native clipboard sync + Dock icon guard)
-#   2. fexdarwin-run  (FEXCore push/pop/ret boundary fix #25 + LKD ptrace SIGSTOP race fix)
-#   3. Neptune server (512 MiB resource upload cap + same-process D3D11 shared textures / IDXGIKeyedMutex)
+#   2. fexdarwin-run  (FEXCore push/pop/ret fix #25 + single demand-paged 512 MiB CodeBuffer + thread reaping + LKD ptrace SIGSTOP & MADV_FREE fixes)
+#   3. Neptune        (512 MiB upload cap + shared textures server + reusable map_pool slab allocator & upload_shmem shrink guest DLLs)
 #   4. Wine media + clipboard pack (Proton-GE FFmpeg 7.1 winedmo/MediaFoundation + mfplat format guard + wineobelisk.drv clipboard sync)
 #
 # Works either with a local wsd binary (`./install-metalfx-wsd.sh /path/to/wsd`) or by downloading
@@ -100,7 +100,7 @@ if [ "${1-}" = "" ]; then
         echo "Installed fexdarwin-run -> $VOILE_ROOT/current/linux/engine/fexdarwin-run"
     fi
 
-    # 3. Install patched Neptune server (512 MiB resource upload cap + same-process D3D11 shared textures / keyed mutex)
+    # 3. Install patched Neptune server + guest DLLs (512 MiB upload cap, shared textures, reusable map_pool & upload_shmem shrink)
     neptune_sha=$(/usr/bin/python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("linux",{}).get("neptune",""))' "$VOILE_ROOT/current/runtime.json" 2>/dev/null || true)
     case "$neptune_sha" in
         265be8a*|be783d9*)
@@ -110,9 +110,23 @@ if [ "${1-}" = "" ]; then
                 install_macho "$tmpdir/libvirglrenderer.1.dylib-arm64" "$VOILE_ROOT/current/linux/graphics/lib/libvirglrenderer.1.dylib"
                 echo "Installed Neptune server (512 MiB cap + shared textures) -> $VOILE_ROOT/current/linux/graphics/"
             fi
+            if [ -d "$VOILE_ROOT/current/linux/windows" ] && \
+               download_verified "$RELEASE_BASE/neptune-windows-x86_64.tar.gz" "$RELEASE_BASE/neptune-windows-x86_64.tar.gz.sha256" "$tmpdir/neptune-windows-x86_64.tar.gz" 2>/dev/null; then
+                mkdir -p "$tmpdir/neptune-win"
+                /usr/bin/tar -xzf "$tmpdir/neptune-windows-x86_64.tar.gz" -C "$tmpdir/neptune-win"
+                /usr/bin/xattr -cr "$tmpdir/neptune-win" 2>/dev/null || true
+                for dll in "$tmpdir/neptune-win"/*.dll; do
+                    [ -f "$dll" ] || continue
+                    local_name=$(basename "$dll")
+                    /bin/cp -f "$dll" "$VOILE_ROOT/current/linux/windows/${local_name}.new"
+                    chmod 755 "$VOILE_ROOT/current/linux/windows/${local_name}.new"
+                    /bin/mv -f "$VOILE_ROOT/current/linux/windows/${local_name}.new" "$VOILE_ROOT/current/linux/windows/${local_name}"
+                done
+                echo "Installed Neptune guest DLLs (reusable map_pool + upload_shmem shrink) -> $VOILE_ROOT/current/linux/windows/"
+            fi
             ;;
         *)
-            echo "Skipping Neptune server (runtime Neptune commit '$neptune_sha' differs)."
+            echo "Skipping Neptune server/DLLs (runtime Neptune commit '$neptune_sha' differs)."
             ;;
     esac
 

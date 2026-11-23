@@ -458,7 +458,22 @@ static int madvise_one(lkd_task *t, lkd_mm *mm, mm_vma *v, uint64_t s, uint64_t 
     case LX_MADV_FREE:
         if (locked) return -LX_EINVAL;
         if (!anon_private) return -LX_EINVAL;
-        return 0; /* lazy free: content may stay until written or reclaimed; nothing is reclaimed here */
+        if (!(v->prot & LX_PROT_EXEC)) {
+            uint64_t is = HP_UP(s), ie = HP_DOWN(e);
+            if (is < ie) {
+                mm_watch_lock();
+                uint64_t run = is;
+                for (uint64_t p = is; p < ie; p += mm_hps) {
+                    if (mm_watched(p)) {
+                        if (run < p) (void)madvise(mm_h(run), p - run, MADV_FREE);
+                        run = p + mm_hps;
+                    }
+                }
+                if (run < ie) (void)madvise(mm_h(run), ie - run, MADV_FREE);
+                mm_watch_unlock();
+            }
+        }
+        return 0;
     case LX_MADV_REMOVE:
         if (locked) return -LX_EINVAL;
         if (!v->bk) return -LX_EINVAL;

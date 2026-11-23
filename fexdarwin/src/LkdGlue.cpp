@@ -174,7 +174,10 @@ void ReapDeadThreads() {
   if (lkd_task_release(T->Task, &Status)) {
     ExitProcess(Status);
   }
-  // The main guest thread is joined by RunWithLkd itself; every other thread is reaped by a later thread creation.
+  // Reap previously exited threads now so dead FEX thread states (and any old CodeBuffer refs they hold)
+  // don't linger indefinitely when a burst of worker threads exits without another clone().
+  ReapDeadThreads();
+  // The main guest thread is joined by RunWithLkd itself; every other thread is reaped by a later exit or clone.
   if (!T->IsMain && Host) {
     std::lock_guard<std::mutex> Lk(DeadLock);
     DeadThreads.emplace_back(T, Host);

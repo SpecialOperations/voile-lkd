@@ -138,14 +138,19 @@ void RegionAllocated(uint64_t CodeBegin, uint64_t RegionBegin, size_t RegionSize
   Guard G(&Lock);
   for (auto& P : Pools) {
     if (P.Base.load(std::memory_order_relaxed)) continue;
+    bool Fresh = false;
     if (P.Capacity < Slots) {
       if (P.Recs) munmap(P.Recs, sizeof(Record) * P.Capacity);
       void* M = mmap(nullptr, sizeof(Record) * Slots, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
       P.Recs = M == MAP_FAILED ? nullptr : static_cast<Record*>(M);
       P.Capacity = P.Recs ? Slots : 0;
+      P.Used = 0;
       if (!P.Recs) return;
+      Fresh = true;
     }
-    memset(static_cast<void*>(P.Recs), 0, sizeof(Record) * Slots); // a reused array: no record of the old buffer
+    if (!Fresh && P.Used > 0) {
+      memset(static_cast<void*>(P.Recs), 0, sizeof(Record) * P.Used); // reused array: clear only slots used by the old buffer
+    }
     P.CodeBegin = CodeBegin;
     P.Bytes = static_cast<uint64_t>(Slots) * SlotBytes;
     P.Used = 0;

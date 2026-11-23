@@ -1,0 +1,134 @@
+diff --git a/FEXCore/Source/Interface/Core/CPUBackend.h b/FEXCore/Source/Interface/Core/CPUBackend.h
+index 1d19bc1..e11ac0f 100644
+--- a/FEXCore/Source/Interface/Core/CPUBackend.h
++++ b/FEXCore/Source/Interface/Core/CPUBackend.h
+@@ -138,6 +138,10 @@ namespace CPU {
+     [[nodiscard]]
+     fextl::shared_ptr<CodeBuffer> CheckCodeBufferUpdate();
+ 
++    CodeBuffer* GetCurrentCodeBuffer() const {
++      return CurrentCodeBuffer.get();
++    }
++
+   protected:
+     // Max spill slot size in bytes. We need at most 32 bytes
+     // to be able to handle a 256-bit vector store to a slot.
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index e56538c..30858d4 100644
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -991,6 +991,14 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
+   // Invalidate might take a unique lock on this, to guarantee that during invalidation no code gets compiled
+   auto lk = GuardSignalDeferringSection<std::shared_lock>(CodeInvalidationMutex, Thread);
+ 
++  // Migrate off any superseded CodeBuffer before checking L3 so threads that only execute
++  // already-translated blocks don't pin old CodeBuffers and their GuestToHostMaps indefinitely.
++  if (auto Prev = Thread->CPUBackend->CheckCodeBufferUpdate()) {
++    Allocator::VirtualDontNeed(Thread->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
++    auto CacheLock = Thread->LookupCache->AcquireWriteLock();
++    Thread->LookupCache->ChangeGuestToHostMapping(*Prev, *Thread->CPUBackend->GetCurrentCodeBuffer()->LookupCache, CacheLock);
++  }
++
+   // Is the code in the cache?
+   // The backends only check L1 and L2, not L3
+   if (auto HostCode = Thread->LookupCache->FindBlock(Thread, GuestRIP)) {
+diff --git a/FEXCore/Source/Interface/Core/SharedCodeBufferManager.cpp b/FEXCore/Source/Interface/Core/SharedCodeBufferManager.cpp
+index d512692..140a259 100644
+--- a/FEXCore/Source/Interface/Core/SharedCodeBufferManager.cpp
++++ b/FEXCore/Source/Interface/Core/SharedCodeBufferManager.cpp
+@@ -12,12 +12,19 @@
+ #endif
+ 
+ namespace FEXCore::CPU {
+-static constexpr size_t INITIAL_CODE_SIZE = 1024 * 1024 * 16;
+ // Darwin port: 512 MiB instead of 128 MiB. A full buffer drops every translation (ClearCodeCache): THE FINALS filled
+ // 128 MiB every one to two minutes of play, and each clear retranslated its working set on the game thread. Block links
+ // out of branch range go through their jump thunk (Arm64JITCore::ExitFunctionLink), and patch stubs stay in range
+ // through the zones of CodeBuffer.
+ static constexpr size_t MAX_CODE_SIZE = 1024 * 1024 * 512;
++#ifdef __APPLE__
++// Darwin port: MAP_JIT is demand-paged (zero physical RAM for untouched pages). Starting at MAX_CODE_SIZE avoids
++// geometric 16 -> 32 -> 64 -> 128 -> 256 MiB growth, which recompiled large games 4 times and left sleeping/idle
++// threads pinning all superseded CodeBuffers and their GuestToHostMaps indefinitely.
++static constexpr size_t INITIAL_CODE_SIZE = MAX_CODE_SIZE;
++#else
++static constexpr size_t INITIAL_CODE_SIZE = 1024 * 1024 * 16;
++#endif
+ 
+ CodeBuffer::CodeBuffer(size_t Size, bool ShouldBeNamed)
+   : AllocatedSize(Size) {
+diff --git a/FEXCore/Source/Interface/IR/Passes/RegisterAllocationPass.cpp b/FEXCore/Source/Interface/IR/Passes/RegisterAllocationPass.cpp
+index 0f0a9c8..e9d8d07 100644
+--- a/FEXCore/Source/Interface/IR/Passes/RegisterAllocationPass.cpp
++++ b/FEXCore/Source/Interface/IR/Passes/RegisterAllocationPass.cpp
+@@ -63,7 +63,7 @@ public:
+     : CPUID {CPUID} {}
+   void Run(IREmitter* IREmit) override;
+   void AddRegisters(IR::RegClass Class, uint32_t RegisterCount) override;
+-  bool TryPostRAMerge(Ref LastNode, Ref CodeNode, IROp_Header* IROp);
++  bool TryPostRAMerge(Ref LastNode, Ref CodeNode, IROp_Header* IROp, bool CrossedGuestOpcode);
+ 
+ private:
+   RegisterClassData Classes[IR::NumClasses];
+@@ -480,10 +480,13 @@ static bool IsZero(const IROp_Header* IROp) {
+   return IROp->Op == OP_CONSTANT && IROp->C<IROp_Constant>()->Constant == 0;
+ }
+ 
+-bool ConstrainedRAPass::TryPostRAMerge(Ref LastNode, Ref CodeNode, IROp_Header* IROp) {
++bool ConstrainedRAPass::TryPostRAMerge(Ref LastNode, Ref CodeNode, IROp_Header* IROp, bool CrossedGuestOpcode) {
+   auto LastOp = IR->GetOp<IROp_Header>(LastNode);
+ 
+-  if (IROp->Op == OP_PUSH && LastOp->Op == OP_PUSH) {
++  // Never merge OP_PUSH/OP_POP across a guest instruction boundary (OP_GUESTOPCODE):
++  // hoisting the second instruction's stack update before its OP_GUESTOPCODE causes
++  // async signal interruption at that boundary to replay push/pop/ret (Zagrios/voile-lkd#25).
++  if (!CrossedGuestOpcode && IROp->Op == OP_PUSH && LastOp->Op == OP_PUSH) {
+     auto SP = PhysicalRegister(CodeNode);
+     auto Push = IR->GetOp<IROp_Push>(CodeNode);
+     auto LastPush = IR->GetOp<IROp_Push>(LastNode);
+@@ -497,7 +500,7 @@ bool ConstrainedRAPass::TryPostRAMerge(Ref LastNode, Ref CodeNode, IROp_Header*
+       IREmit->RemovePostRA(CodeNode);
+       return true;
+     }
+-  } else if (IROp->Op == OP_POP) {
++  } else if (!CrossedGuestOpcode && IROp->Op == OP_POP) {
+     auto SP = PhysicalRegister(IROp->Args[0]);
+ 
+     if (LastOp->Op == OP_POP && LastOp->Size == IROp->Size && IROp->Size >= OpSize::i32Bit && SP == PhysicalRegister(LastOp->Args[0])) {
+@@ -637,6 +640,7 @@ void ConstrainedRAPass::Run(IREmitter* IREmit_) {
+ 
+     // Last nontrivial instruction, for merging as we go.
+     Ref LastNode = nullptr;
++    bool CrossedGuestOpcode = false;
+ 
+     // Forward pass: Assign registers, spilling & optimizing as we go.
+     for (auto [CodeNode, IROp] : IR->GetCode(BlockNode)) {
+@@ -645,7 +649,11 @@ void ConstrainedRAPass::Run(IREmitter* IREmit_) {
+       // These do not read or write registers, and must be skipped for merging.
+       // Since we'd be doing this check anyway for merging, do the check now so
+       // we can skip the rest of the logic too.
+-      if (IROp->Op == OP_GUESTOPCODE || IROp->Op == OP_INLINECONSTANT) {
++      if (IROp->Op == OP_GUESTOPCODE) {
++        CrossedGuestOpcode = true;
++        continue;
++      }
++      if (IROp->Op == OP_INLINECONSTANT) {
+         continue;
+       }
+ 
+@@ -745,12 +753,14 @@ void ConstrainedRAPass::Run(IREmitter* IREmit_) {
+       if (IsTrivial(CodeNode, IROp)) {
+         // Delete instructions that only exist for RA
+         IREmit->RemovePostRA(CodeNode);
+-      } else if (LastNode && TryPostRAMerge(LastNode, CodeNode, IROp)) {
++      } else if (LastNode && TryPostRAMerge(LastNode, CodeNode, IROp, CrossedGuestOpcode)) {
+         // Merge adjacent instructions
+         IREmit->RemovePostRA(LastNode);
+         LastNode = nullptr;
++        CrossedGuestOpcode = false;
+       } else {
+         LastNode = CodeNode;
++        CrossedGuestOpcode = false;
+       }
+     }
+ 
