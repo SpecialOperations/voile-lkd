@@ -1,0 +1,1998 @@
+diff --git a/configure.ac b/configure.ac
+index be6e92b..f602268 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -1082,6 +1082,22 @@ enable_winecoreaudio_drv=${enable_winecoreaudio_drv:-no}
+ enable_wineandroid_drv=${enable_wineandroid_drv:-no}
+ enable_winemac_drv=${enable_winemac_drv:-no}
+ 
++dnl Obelisk: the drivers of voile-lkd's Linux engine (wsd window server, Neptune) need Linux system calls
++case $host_os in
++  linux*) ;;
++  *)
++    enable_wineobeliskaudio_drv=${enable_wineobeliskaudio_drv:-no}
++    enable_nptunix=${enable_nptunix:-no}
++    enable_wineobelisk_drv=${enable_wineobelisk_drv:-no}
++    ;;
++esac
++
++dnl Obelisk: where ntdll's system call stubs go in its image (dlls/ntdll/Makefile.in): first on Linux hosts
++case $host_os in
++  linux*) AC_SUBST(NTDLL_SYSCALLS_FIRST,signal_x86_64.c) ;;
++  *) AC_SUBST(NTDLL_SYSCALLS_IN_ORDER,signal_x86_64.c) ;;
++esac
++
+ dnl **** External libraries ****
+ 
+ if test "x$with_system_dllpath" != "x" -a -n "$PE_ARCHS"
+@@ -3101,6 +3117,7 @@ WINE_CONFIG_MAKEFILE(dlls/netprofm/tests)
+ WINE_CONFIG_MAKEFILE(dlls/netutils)
+ WINE_CONFIG_MAKEFILE(dlls/newdev)
+ WINE_CONFIG_MAKEFILE(dlls/ninput)
++WINE_CONFIG_MAKEFILE(dlls/nptunix)
+ WINE_CONFIG_MAKEFILE(dlls/ninput/tests)
+ WINE_CONFIG_MAKEFILE(dlls/normaliz)
+ WINE_CONFIG_MAKEFILE(dlls/npmshtml)
+@@ -3444,6 +3461,8 @@ WINE_CONFIG_MAKEFILE(dlls/winegstreamer)
+ WINE_CONFIG_MAKEFILE(dlls/winehid.sys)
+ WINE_CONFIG_MAKEFILE(dlls/winemac.drv)
+ WINE_CONFIG_MAKEFILE(dlls/winemapi)
++WINE_CONFIG_MAKEFILE(dlls/wineobelisk.drv)
++WINE_CONFIG_MAKEFILE(dlls/wineobeliskaudio.drv)
+ WINE_CONFIG_MAKEFILE(dlls/wineoss.drv)
+ WINE_CONFIG_MAKEFILE(dlls/wineps.drv)
+ WINE_CONFIG_MAKEFILE(dlls/wineps16.drv16)
+diff --git a/dlls/mmdevapi/main.c b/dlls/mmdevapi/main.c
+index 66dae85..f243b68 100644
+--- a/dlls/mmdevapi/main.c
++++ b/dlls/mmdevapi/main.c
+@@ -125,7 +125,7 @@ fail:
+ 
+ static BOOL WINAPI init_driver(INIT_ONCE *once, void *param, void **context)
+ {
+-    static WCHAR default_list[] = L"pulse,alsa,oss,coreaudio";
++    static WCHAR default_list[] = L"obeliskaudio,pulse,alsa,oss,coreaudio"; /* Obelisk: wsd (CoreAudio on the host) first */
+     DriverFuncs driver;
+     HKEY key;
+     WCHAR reg_list[256], *p, *next, *driver_list = default_list;
+diff --git a/dlls/ntdll/Makefile.in b/dlls/ntdll/Makefile.in
+index 1469e3a..e8b621f 100644
+--- a/dlls/ntdll/Makefile.in
++++ b/dlls/ntdll/Makefile.in
+@@ -12,6 +12,7 @@ i386_EXTRADLLFLAGS = -Wl,--image-base,0x7bc00000
+ x86_64_EXTRADLLFLAGS = -Wl,--image-base,0x170000000
+ 
+ SOURCES = \
++	$(NTDLL_SYSCALLS_FIRST) \
+ 	actctx.c \
+ 	atom.c \
+ 	crypt.c \
+@@ -40,7 +41,7 @@ SOURCES = \
+ 	signal_arm64.c \
+ 	signal_arm64ec.c \
+ 	signal_i386.c \
+-	signal_x86_64.c \
++	$(NTDLL_SYSCALLS_IN_ORDER) \
+ 	string.c \
+ 	sync.c \
+ 	thread.c \
+diff --git a/dlls/ntdll/unix/debug.c b/dlls/ntdll/unix/debug.c
+index 992e7c4..15aad79 100644
+--- a/dlls/ntdll/unix/debug.c
++++ b/dlls/ntdll/unix/debug.c
+@@ -453,6 +453,7 @@ NTSTATUS WINAPI NtTraceControl( ULONG code, void *inbuf, ULONG inbuf_len,
+  */
+ NTSTATUS WINAPI NtSetDebugFilterState( ULONG component_id, ULONG level, BOOLEAN state )
+ {
++    SYSCALL_SMALL_ARG( state );
+     FIXME( "component_id %#x, level %u, state %#x stub.\n", component_id, level, state );
+ 
+     return STATUS_SUCCESS;
+diff --git a/dlls/ntdll/unix/env.c b/dlls/ntdll/unix/env.c
+index 3145868..b370716 100644
+--- a/dlls/ntdll/unix/env.c
++++ b/dlls/ntdll/unix/env.c
+@@ -2299,6 +2299,7 @@ NTSTATUS WINAPI NtInitializeNlsFiles( void **ptr, LCID *lcid, LARGE_INTEGER *siz
+  */
+ NTSTATUS WINAPI NtQueryDefaultLocale( BOOLEAN user, LCID *lcid )
+ {
++    SYSCALL_SMALL_ARG( user );
+     *lcid = user ? user_lcid : system_lcid;
+     return STATUS_SUCCESS;
+ }
+@@ -2309,6 +2310,7 @@ NTSTATUS WINAPI NtQueryDefaultLocale( BOOLEAN user, LCID *lcid )
+  */
+ NTSTATUS WINAPI NtSetDefaultLocale( BOOLEAN user, LCID lcid )
+ {
++    SYSCALL_SMALL_ARG( user );
+     if (user) user_lcid = lcid;
+     else system_lcid = lcid;
+     return STATUS_SUCCESS;
+diff --git a/dlls/ntdll/unix/file.c b/dlls/ntdll/unix/file.c
+index 964752c..b3ba58e 100644
+--- a/dlls/ntdll/unix/file.c
++++ b/dlls/ntdll/unix/file.c
+@@ -2934,6 +2934,8 @@ NTSTATUS WINAPI NtQueryDirectoryFile( HANDLE handle, HANDLE event, PIO_APC_ROUTI
+                                       FILE_INFORMATION_CLASS info_class, BOOLEAN single_entry,
+                                       UNICODE_STRING *mask, BOOLEAN restart_scan )
+ {
++    SYSCALL_SMALL_ARG( single_entry );
++    SYSCALL_SMALL_ARG( restart_scan );
+     int cwd, fd, needs_close;
+     enum server_fd_type type;
+     struct dir_data *data;
+@@ -7458,6 +7460,8 @@ NTSTATUS WINAPI NtLockFile( HANDLE file, HANDLE event, PIO_APC_ROUTINE apc, void
+                             IO_STATUS_BLOCK *io_status, LARGE_INTEGER *offset,
+                             LARGE_INTEGER *count, ULONG *key, BOOLEAN dont_wait, BOOLEAN exclusive )
+ {
++    SYSCALL_SMALL_ARG( dont_wait );
++    SYSCALL_SMALL_ARG( exclusive );
+     static int warn;
+     unsigned int ret;
+     HANDLE handle;
+@@ -7630,6 +7634,7 @@ NTSTATUS WINAPI NtNotifyChangeDirectoryFile( HANDLE handle, HANDLE event, PIO_AP
+                                              void *apc_context, IO_STATUS_BLOCK *iosb, void *buffer,
+                                              ULONG buffer_size, ULONG filter, BOOLEAN subtree )
+ {
++    SYSCALL_SMALL_ARG( subtree );
+     struct async_fileio_read_changes *fileio;
+     unsigned int status;
+     ULONG size = max( 4096, buffer_size );
+@@ -8145,6 +8150,8 @@ NTSTATUS WINAPI NtQueryEaFile( HANDLE handle, IO_STATUS_BLOCK *io, void *buffer,
+                                BOOLEAN single_entry, void *list, ULONG list_len,
+                                ULONG *index, BOOLEAN restart )
+ {
++    SYSCALL_SMALL_ARG( single_entry );
++    SYSCALL_SMALL_ARG( restart );
+     int fd, needs_close;
+     NTSTATUS status;
+ 
+diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
+index 2cc53c3..11f9d0b 100644
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -298,10 +298,11 @@ static WORD get_alt_machine( WORD machine )
+ 
+ static void set_dll_path(void)
+ {
+-    char *p, *path = getenv( "WINEDLLPATH" ), *be_runtime = getenv( "PROTON_BATTLEYE_RUNTIME" ), *eac_runtime = getenv( "PROTON_EAC_RUNTIME" );
++    char *p, *path = getenv( "WINEDLLPATH" ), *first = getenv( "WINEDLLPATH_PREPEND" ), *be_runtime = getenv( "PROTON_BATTLEYE_RUNTIME" ), *eac_runtime = getenv( "PROTON_EAC_RUNTIME" );
+     int i, count = 0;
+ 
+     if (path) for (p = path, count = 1; *p; p++) if (*p == ':') count++;
++    if (first) for (p = first, count++; *p; p++) if (*p == ':') count++;
+ 
+     if (be_runtime)
+         count += 2;
+@@ -312,6 +313,13 @@ static void set_dll_path(void)
+     dll_paths = malloc( (count + 2) * sizeof(*dll_paths) );
+     count = 0;
+ 
++    if (first)
++    {
++        first = strdup( first );
++        for (p = strtok( first, ":" ); p; p = strtok( NULL, ":" )) dll_paths[count++] = strdup( p );
++        free( first );
++    }
++
+     if (!build_dir) dll_paths[count++] = dll_dir;
+ 
+     if (path)
+@@ -485,18 +493,7 @@ char *get_alternate_wineloader( WORD machine )
+ static void preloader_exec( char **argv, WORD machine )
+ {
+ #ifdef HAVE_WINE_PRELOADER
+-#if !defined(__arm__) && !defined(__aarch64__)
+-    const char *p;
+-
+-    if (machine == IMAGE_FILE_MACHINE_AMD64
+-        && ((p = remove_tail( argv[1], "x86_64-unix/wine" )) || (p = remove_tail( argv[1], "i386-unix/wine64" ))))
+-    {
+-        asprintf( &argv[0], "%si386-unix/wine64-preloader", p );
+-        asprintf( &argv[1], "%si386-unix/wine64", p );
+-    }
+-    else
+-#endif
+-        asprintf( &argv[0], "%s-preloader", argv[1] );
++    asprintf( &argv[0], "%s-preloader", argv[1] );
+ 
+ #ifdef __APPLE__
+     {
+diff --git a/dlls/ntdll/unix/registry.c b/dlls/ntdll/unix/registry.c
+index 6b4457d..77495a3 100644
+--- a/dlls/ntdll/unix/registry.c
++++ b/dlls/ntdll/unix/registry.c
+@@ -872,6 +872,8 @@ NTSTATUS WINAPI NtNotifyChangeMultipleKeys( HANDLE key, ULONG count, OBJECT_ATTR
+                                             IO_STATUS_BLOCK *io, ULONG filter, BOOLEAN subtree,
+                                             void *buffer, ULONG length, BOOLEAN async )
+ {
++    SYSCALL_SMALL_ARG( subtree );
++    SYSCALL_SMALL_ARG( async );
+     unsigned int ret;
+ 
+     TRACE( "(%p,%u,%p,%p,%p,%p,%p,0x%08x, 0x%08x,%p,0x%08x,0x%08x)\n",
+@@ -915,6 +917,8 @@ NTSTATUS WINAPI NtNotifyChangeKey( HANDLE key, HANDLE event, PIO_APC_ROUTINE apc
+                                    IO_STATUS_BLOCK *io, ULONG filter, BOOLEAN subtree,
+                                    void *buffer, ULONG length, BOOLEAN async )
+ {
++    SYSCALL_SMALL_ARG( subtree );
++    SYSCALL_SMALL_ARG( async );
+     return NtNotifyChangeMultipleKeys( key, 0, NULL, event, apc, apc_context,
+                                        io, filter, subtree, buffer, length, async );
+ }
+diff --git a/dlls/ntdll/unix/security.c b/dlls/ntdll/unix/security.c
+index 9931239..8fe277b 100644
+--- a/dlls/ntdll/unix/security.c
++++ b/dlls/ntdll/unix/security.c
+@@ -186,6 +186,7 @@ NTSTATUS WINAPI NtOpenProcessTokenEx( HANDLE process, DWORD access, DWORD attrib
+  */
+ NTSTATUS WINAPI NtOpenThreadToken( HANDLE thread, DWORD access, BOOLEAN self, HANDLE *handle )
+ {
++    SYSCALL_SMALL_ARG( self );
+     return NtOpenThreadTokenEx( thread, access, self, 0, handle );
+ }
+ 
+@@ -196,6 +197,7 @@ NTSTATUS WINAPI NtOpenThreadToken( HANDLE thread, DWORD access, BOOLEAN self, HA
+ NTSTATUS WINAPI NtOpenThreadTokenEx( HANDLE thread, DWORD access, BOOLEAN self, DWORD attributes,
+                                      HANDLE *handle )
+ {
++    SYSCALL_SMALL_ARG( self );
+     unsigned int ret;
+ 
+     TRACE( "(%p,0x%08x,%u,0x%08x,%p)\n", thread, access, self, attributes, handle );
+@@ -223,6 +225,7 @@ NTSTATUS WINAPI NtOpenThreadTokenEx( HANDLE thread, DWORD access, BOOLEAN self,
+ NTSTATUS WINAPI NtDuplicateToken( HANDLE token, ACCESS_MASK access, OBJECT_ATTRIBUTES *attr,
+                                   BOOLEAN effective_only, TOKEN_TYPE type, HANDLE *handle )
+ {
++    SYSCALL_SMALL_ARG( effective_only );
+     SECURITY_IMPERSONATION_LEVEL level = SecurityAnonymous;
+     unsigned int status;
+     data_size_t len;
+@@ -773,6 +776,7 @@ NTSTATUS WINAPI NtCreateLowBoxToken( HANDLE *token_handle, HANDLE token, ACCESS_
+ NTSTATUS WINAPI NtAdjustGroupsToken( HANDLE token, BOOLEAN reset, TOKEN_GROUPS *groups,
+                                      ULONG length, TOKEN_GROUPS *prev, ULONG *retlen )
+ {
++    SYSCALL_SMALL_ARG( reset );
+     FIXME( "%p %d %p %u %p %p\n", token, reset, groups, length, prev, retlen );
+     return STATUS_NOT_IMPLEMENTED;
+ }
+@@ -784,6 +788,7 @@ NTSTATUS WINAPI NtAdjustGroupsToken( HANDLE token, BOOLEAN reset, TOKEN_GROUPS *
+ NTSTATUS WINAPI NtAdjustPrivilegesToken( HANDLE token, BOOLEAN disable, TOKEN_PRIVILEGES *privs,
+                                          DWORD length, TOKEN_PRIVILEGES *prev, DWORD *retlen )
+ {
++    SYSCALL_SMALL_ARG( disable );
+     unsigned int ret;
+ 
+     TRACE( "(%p,0x%08x,%p,0x%08x,%p,%p)\n", token, disable, privs, length, prev, retlen );
+@@ -969,6 +974,7 @@ NTSTATUS WINAPI NtAccessCheckAndAuditAlarm( UNICODE_STRING *subsystem, HANDLE ha
+                                             ACCESS_MASK *access_granted, NTSTATUS *access_status,
+                                             BOOLEAN *onclose )
+ {
++    SYSCALL_SMALL_ARG( creation );
+     FIXME( "(%s, %p, %s, %p, 0x%08x, %p, %d, %p, %p, %p), stub\n",
+            debugstr_us(subsystem), handle, debugstr_us(typename), descr, access,
+            mapping, creation, access_granted, access_status, onclose );
+@@ -988,6 +994,7 @@ NTSTATUS WINAPI NtAccessCheckByTypeAndAuditAlarm( UNICODE_STRING *subsystem, HAN
+                                                   ACCESS_MASK *access_granted, NTSTATUS *access_status,
+                                                   BOOLEAN *onclose )
+ {
++    SYSCALL_SMALL_ARG( creation );
+     FIXME( "(%s, %p, %s, %s, %p, 0x%08x, %u, %x, %p, %u, %p, %d, %p, %p, %p), stub\n",
+            debugstr_us(subsystem), handle, debugstr_us(typename), debugstr_us(objectname),
+            descr, access, audit_type, flags, obj_list, list_len,
+@@ -1001,6 +1008,7 @@ NTSTATUS WINAPI NtAccessCheckByTypeAndAuditAlarm( UNICODE_STRING *subsystem, HAN
+  */
+ NTSTATUS WINAPI NtCloseObjectAuditAlarm( UNICODE_STRING *subsystem, HANDLE handle, BOOLEAN onclose )
+ {
++    SYSCALL_SMALL_ARG( onclose );
+     FIXME( "%s %p %u: stub\n", debugstr_us(subsystem), handle, onclose );
+     return STATUS_NOT_IMPLEMENTED;
+ }
+diff --git a/dlls/ntdll/unix/server.c b/dlls/ntdll/unix/server.c
+index 61b9b30..68e2731 100644
+--- a/dlls/ntdll/unix/server.c
++++ b/dlls/ntdll/unix/server.c
+@@ -849,6 +849,7 @@ unsigned int server_wait_for_object( HANDLE handle, BOOL alertable, const LARGE_
+  */
+ NTSTATUS WINAPI NtContinue( CONTEXT *context, BOOLEAN alertable )
+ {
++    SYSCALL_SMALL_ARG( alertable );
+     return NtContinueEx( context, ULongToPtr(alertable) );
+ }
+ 
+diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
+index 751d955..ee4992d 100644
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -555,7 +555,7 @@ static pthread_mutex_t instrumentation_callback_mutex = PTHREAD_MUTEX_INITIALIZE
+ 
+ void set_process_instrumentation_callback( void *callback )
+ {
+-    void *ptr = (char *)user_shared_data + page_size;
++    void *ptr = (char *)user_shared_data + USD_SYSCALL_DISPATCHER_OFFSET;
+     sigset_t sigset;
+     void *old;
+ 
+@@ -3027,9 +3027,9 @@ void signal_init_process(void)
+ 
+     thread_data->syscall_frame = (struct syscall_frame *)(((ULONG_PTR)kernel_stack - frame_size) & ~(ULONG_PTR)63);
+ 
+-    /* sneak in a syscall dispatcher pointer at a fixed address (7ffe1000) */
+-    ptr = (char *)user_shared_data + page_size;
+-    anon_mmap_fixed( ptr, page_size, PROT_READ | PROT_WRITE, 0 );
++    /* sneak in a syscall dispatcher pointer at a fixed address (7ffe4000, see USD_SYSCALL_DISPATCHER_OFFSET),
++     * in the page that virtual_alloc_first_teb() committed read-write */
++    ptr = (char *)user_shared_data + USD_SYSCALL_DISPATCHER_OFFSET;
+     *(void **)ptr = __wine_syscall_dispatcher;
+ 
+     xstate_extended_features = user_shared_data->XState.EnabledFeatures & ~(UINT64)3;
+diff --git a/dlls/ntdll/unix/sync.c b/dlls/ntdll/unix/sync.c
+index 67ab945..a591b37 100644
+--- a/dlls/ntdll/unix/sync.c
++++ b/dlls/ntdll/unix/sync.c
+@@ -1122,6 +1122,7 @@ NTSTATUS WINAPI NtReleaseSemaphore( HANDLE handle, ULONG count, ULONG *previous
+ NTSTATUS WINAPI NtCreateEvent( HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr,
+                                EVENT_TYPE type, BOOLEAN state )
+ {
++    SYSCALL_SMALL_ARG( state );
+     unsigned int ret;
+     data_size_t len;
+     struct object_attributes *objattr;
+@@ -1313,6 +1314,7 @@ NTSTATUS WINAPI NtQueryEvent( HANDLE handle, EVENT_INFORMATION_CLASS class,
+ NTSTATUS WINAPI NtCreateMutant( HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr,
+                                 BOOLEAN owned )
+ {
++    SYSCALL_SMALL_ARG( owned );
+     unsigned int ret;
+     data_size_t len;
+     struct object_attributes *objattr;
+@@ -1854,6 +1856,7 @@ static NTSTATUS get_image_machine( HANDLE handle, USHORT *machine )
+ NTSTATUS WINAPI NtWaitForDebugEvent( HANDLE handle, BOOLEAN alertable, LARGE_INTEGER *timeout,
+                                      DBGUI_WAIT_STATE_CHANGE *state )
+ {
++    SYSCALL_SMALL_ARG( alertable );
+     union debug_event_data data;
+     unsigned int ret;
+     BOOL wait = TRUE;
+@@ -1959,6 +1962,8 @@ NTSTATUS WINAPI NtQueryDirectoryObject( HANDLE handle, DIRECTORY_BASIC_INFORMATI
+                                         ULONG size, BOOLEAN single_entry, BOOLEAN restart,
+                                         ULONG *context, ULONG *ret_size )
+ {
++    SYSCALL_SMALL_ARG( single_entry );
++    SYSCALL_SMALL_ARG( restart );
+     unsigned int status, i, count, total_len, pos, used_size, used_count, strpool_head;
+     ULONG index = restart ? 0 : *context;
+     struct directory_entry *entries;
+@@ -2238,6 +2243,7 @@ NTSTATUS WINAPI NtOpenTimer( HANDLE *handle, ACCESS_MASK access, const OBJECT_AT
+ NTSTATUS WINAPI NtSetTimer( HANDLE handle, const LARGE_INTEGER *when, PTIMER_APC_ROUTINE callback,
+                             void *arg, BOOLEAN resume, ULONG period, BOOLEAN *state )
+ {
++    SYSCALL_SMALL_ARG( resume );
+     unsigned int ret = STATUS_SUCCESS;
+ 
+     TRACE( "(%p,%p,%p,%p,%08x,0x%08x,%p)\n", handle, when, callback, arg, resume, period, state );
+@@ -2335,6 +2341,7 @@ NTSTATUS WINAPI NtQueryTimer( HANDLE handle, TIMER_INFORMATION_CLASS class,
+ NTSTATUS WINAPI NtWaitForMultipleObjects( DWORD count, const HANDLE *handles, WAIT_TYPE type,
+                                           BOOLEAN alertable, const LARGE_INTEGER *timeout )
+ {
++    SYSCALL_SMALL_ARG( alertable );
+     union select_op select_op;
+     UINT i, flags = SELECT_INTERRUPTIBLE;
+     unsigned int ret;
+@@ -2375,6 +2382,7 @@ NTSTATUS WINAPI NtWaitForMultipleObjects( DWORD count, const HANDLE *handles, WA
+  */
+ NTSTATUS WINAPI NtWaitForSingleObject( HANDLE handle, BOOLEAN alertable, const LARGE_INTEGER *timeout )
+ {
++    SYSCALL_SMALL_ARG( alertable );
+     union select_op select_op;
+     UINT flags = SELECT_INTERRUPTIBLE;
+     unsigned int ret;
+@@ -2402,6 +2410,7 @@ NTSTATUS WINAPI NtWaitForSingleObject( HANDLE handle, BOOLEAN alertable, const L
+ NTSTATUS WINAPI NtSignalAndWaitForSingleObject( HANDLE signal, HANDLE wait,
+                                                 BOOLEAN alertable, const LARGE_INTEGER *timeout )
+ {
++    SYSCALL_SMALL_ARG( alertable );
+     union select_op select_op;
+     UINT flags = SELECT_INTERRUPTIBLE;
+     NTSTATUS ret;
+@@ -2450,6 +2459,7 @@ NTSTATUS WINAPI NtYieldExecution(void)
+  */
+ NTSTATUS WINAPI NtDelayExecution( BOOLEAN alertable, const LARGE_INTEGER *timeout )
+ {
++    SYSCALL_SMALL_ARG( alertable );
+     unsigned int status = STATUS_SUCCESS;
+ 
+     /* if alertable, we need to query the server */
+@@ -2586,6 +2596,7 @@ NTSTATUS WINAPI NtQueryTimerResolution( ULONG *min_res, ULONG *max_res, ULONG *c
+  */
+ NTSTATUS WINAPI NtSetTimerResolution( ULONG res, BOOLEAN set, ULONG *current_res )
+ {
++    SYSCALL_SMALL_ARG( set );
+     static BOOL has_request = FALSE;
+ 
+     TRACE( "(%u,%u,%p), semi-stub!\n", res, set, current_res );
+@@ -2713,6 +2724,7 @@ NTSTATUS WINAPI NtOpenKeyedEvent( HANDLE *handle, ACCESS_MASK access, const OBJE
+ NTSTATUS WINAPI NtWaitForKeyedEvent( HANDLE handle, const void *key,
+                                      BOOLEAN alertable, const LARGE_INTEGER *timeout )
+ {
++    SYSCALL_SMALL_ARG( alertable );
+     union select_op select_op;
+     UINT flags = SELECT_INTERRUPTIBLE;
+ 
+@@ -2734,6 +2746,7 @@ NTSTATUS WINAPI NtWaitForKeyedEvent( HANDLE handle, const void *key,
+ NTSTATUS WINAPI NtReleaseKeyedEvent( HANDLE handle, const void *key,
+                                      BOOLEAN alertable, const LARGE_INTEGER *timeout )
+ {
++    SYSCALL_SMALL_ARG( alertable );
+     union select_op select_op;
+     UINT flags = SELECT_INTERRUPTIBLE;
+ 
+@@ -2915,6 +2928,7 @@ NTSTATUS WINAPI NtRemoveIoCompletion( HANDLE handle, ULONG_PTR *key, ULONG_PTR *
+ NTSTATUS WINAPI NtRemoveIoCompletionEx( HANDLE handle, FILE_IO_COMPLETION_INFORMATION *info, ULONG count,
+                                         ULONG *written, LARGE_INTEGER *timeout, BOOLEAN alertable )
+ {
++    SYSCALL_SMALL_ARG( alertable );
+     HANDLE wait_handle = NULL;
+     unsigned int status;
+     ULONG i = 0;
+@@ -3165,6 +3179,7 @@ NTSTATUS WINAPI NtListenPort( HANDLE handle, LPC_MESSAGE *msg )
+ NTSTATUS WINAPI NtAcceptConnectPort( HANDLE *handle, ULONG id, LPC_MESSAGE *msg, BOOLEAN accept,
+                                      LPC_SECTION_WRITE *write, LPC_SECTION_READ *read )
+ {
++    SYSCALL_SMALL_ARG( accept );
+     FIXME("(%p,%u,%p,%d,%p,%p),stub!\n", handle, id, msg, accept, write, read );
+     return STATUS_NOT_IMPLEMENTED;
+ }
+@@ -3748,6 +3763,7 @@ NTSTATUS WINAPI NtCreateTransaction( HANDLE *handle, ACCESS_MASK mask, OBJECT_AT
+  */
+ NTSTATUS WINAPI NtCommitTransaction( HANDLE transaction, BOOLEAN wait )
+ {
++    SYSCALL_SMALL_ARG( wait );
+     FIXME( "%p, %d stub.\n", transaction, wait );
+ 
+     return STATUS_SUCCESS;
+@@ -3758,6 +3774,7 @@ NTSTATUS WINAPI NtCommitTransaction( HANDLE transaction, BOOLEAN wait )
+  */
+ NTSTATUS WINAPI NtRollbackTransaction( HANDLE transaction, BOOLEAN wait )
+ {
++    SYSCALL_SMALL_ARG( wait );
+     FIXME( "%p, %d stub.\n", transaction, wait );
+ 
+     return STATUS_ACCESS_VIOLATION;
+diff --git a/dlls/ntdll/unix/system.c b/dlls/ntdll/unix/system.c
+index 7da2e6e..ade5597 100644
+--- a/dlls/ntdll/unix/system.c
++++ b/dlls/ntdll/unix/system.c
+@@ -5110,6 +5110,7 @@ NTSTATUS WINAPI NtRaiseHardError( NTSTATUS status, ULONG count,
+ NTSTATUS WINAPI NtInitiatePowerAction( POWER_ACTION action, SYSTEM_POWER_STATE state,
+                                        ULONG flags, BOOLEAN async )
+ {
++    SYSCALL_SMALL_ARG( async );
+     FIXME( "(%d,%d,0x%08x,%d),stub\n", action, state, flags, async );
+     return STATUS_NOT_IMPLEMENTED;
+ }
+diff --git a/dlls/ntdll/unix/thread.c b/dlls/ntdll/unix/thread.c
+index 4e9f198..6861b2d 100644
+--- a/dlls/ntdll/unix/thread.c
++++ b/dlls/ntdll/unix/thread.c
+@@ -1355,6 +1355,7 @@ NTSTATUS WINAPI NtCreateThread( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRI
+                                 HANDLE process, CLIENT_ID *id, CONTEXT *ctx, INITIAL_TEB *teb,
+                                 BOOLEAN suspended )
+ {
++    SYSCALL_SMALL_ARG( suspended );
+     FIXME( "%p %d %p %p %p %p %p %d, stub!\n",
+            handle, access, attr, process, id, ctx, teb, suspended );
+     return STATUS_NOT_IMPLEMENTED;
+diff --git a/dlls/ntdll/unix/unix_private.h b/dlls/ntdll/unix/unix_private.h
+index fe0c0cb..3d2ea6a 100644
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -280,6 +280,8 @@ static inline void set_context_exception_reporting_flags( DWORD *context_flags,
+ extern unsigned int xstate_get_size( UINT64 compaction_mask, UINT64 mask );
+ extern void copy_xstate( XSAVE_AREA_HEADER *dst, XSAVE_AREA_HEADER *src, UINT64 mask );
+ 
++#define USD_SYSCALL_DISPATCHER_OFFSET 0x4000
++
+ extern void set_process_instrumentation_callback( void *callback );
+ 
+ extern void *get_cpu_area( USHORT machine );
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+index 3efac71..3bae788 100644
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -299,7 +299,14 @@ static const UINT page_shift = 12;
+ static const UINT_PTR page_mask = 0xfff;
+ static const UINT_PTR granularity_mask = 0xffff;
+ 
+-#ifdef __aarch64__
++/* Obelisk: an x86-64 Linux guest under FEXCore/LKD sees 4 KiB pages, but the hardware page is 16 KiB and its
++ * protection is the union of its 4 KiB pages. WINE_HOST_PAGE_SIZE=16384 makes Wine use its large host page code
++ * (written for 16 KiB arm64 kernels) for guard pages, stacks, write watches and file mappings. */
++#if defined(__aarch64__) || (defined(__x86_64__) && defined(__linux__))
++#define WINE_VARIABLE_HOST_PAGE
++#endif
++
++#ifdef WINE_VARIABLE_HOST_PAGE
+ static UINT_PTR host_page_size;
+ static UINT_PTR host_page_mask;
+ #else
+@@ -2579,8 +2586,10 @@ static NTSTATUS map_file_into_view( struct file_view *view, int fd, size_t start
+     else
+     {
+         /* changes to the file are not guaranteed to be visible in read-only MAP_PRIVATE mappings,
+-         * but they are on Linux so we take advantage of it */
+-#ifdef __linux__
++         * but they are on Linux so we take advantage of it.
++         * Obelisk: not under LKD (Linux syscalls served on macOS), where a read-only MAP_PRIVATE file mapping is a
++         * snapshot; shared session/queue objects written by wineserver would go stale. Use the portable path. */
++#if defined(__linux__) && !defined(WINE_VARIABLE_HOST_PAGE)
+         flags |= MAP_PRIVATE;
+ #else
+         flags |= MAP_SHARED;
+@@ -3002,6 +3011,27 @@ static void *get_host_addr_space_limit(void)
+         else if (errno == EEXIST) break;
+         addr >>= 1;
+     }
++#ifdef __linux__
++    /* Obelisk: the limit is not always a power of two (an emulated address space ends at 0x7ffffe000000, for
++     * instance): find it to 64 KiB within [addr, addr * 2) instead of letting allocations retry above it. */
++    {
++        UINT_PTR lo = addr, hi = addr << 1;
++        while (hi - lo > granularity_mask + 1)
++        {
++            UINT_PTR mid = ((lo + hi) / 2) & ~granularity_mask;
++            void *ret = mmap( (void *)mid, host_page_size, PROT_NONE, flags, -1, 0 );
++            BOOL ok = FALSE;
++            if (ret != MAP_FAILED)
++            {
++                munmap( ret, host_page_size );
++                ok = (ret == (void *)mid);
++            }
++            else if (errno == EEXIST) ok = TRUE;
++            if (ok) lo = mid; else hi = mid;
++        }
++        if (hi != addr << 1) return (void *)(hi - (granularity_mask + 1));
++    }
++#endif
+     return (void *)((addr << 1) - (granularity_mask + 1));
+ }
+ 
+@@ -3359,6 +3389,7 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
+         if ((sec[i].Characteristics & IMAGE_SCN_MEM_SHARED) &&
+             (sec[i].Characteristics & IMAGE_SCN_MEM_WRITE))
+         {
++            pos = sec[i].VirtualAddress;  /* Obelisk: the server stores each shared section at its RVA */
+             TRACE_(module)( "%s mapping shared section %.8s at %p off %x (%x) size %lx (%lx) flags %x\n",
+                             debugstr_us(nt_name), sec[i].Name, ptr + sec[i].VirtualAddress,
+                             sec[i].PointerToRawData, (int)pos, file_size, map_size,
+@@ -3892,8 +3923,13 @@ void virtual_init(void)
+     pthread_mutex_init( &virtual_mutex, &attr );
+     pthread_mutexattr_destroy( &attr );
+ 
+-#ifdef __aarch64__
++#ifdef WINE_VARIABLE_HOST_PAGE
+     host_page_size = sysconf( _SC_PAGESIZE );
++    {
++        const char *env = getenv( "WINE_HOST_PAGE_SIZE" );
++        UINT_PTR size = env ? strtoul( env, NULL, 0 ) : 0;
++        if (size > host_page_size && size <= 0x10000 && !(size & (size - 1))) host_page_size = size;
++    }
+     host_page_mask = host_page_size - 1;
+     TRACE( "host page size: %uk\n", (UINT)host_page_size / 1024 );
+ #endif
+@@ -4288,9 +4324,30 @@ TEB *virtual_alloc_first_teb(void)
+     SIZE_T block_size = signal_stack_mask + 1;
+     SIZE_T total = 32 * block_size;
+ 
+-    /* reserve space for shared user data */
+-    status = NtAllocateVirtualMemory( NtCurrentProcess(), (void **)&user_shared_data, 0, &data_size,
+-                                      MEM_RESERVE | MEM_COMMIT, PAGE_READONLY );
++    /* Reserve the whole 64 KiB allocation granularity block of the shared user data, like Windows does, and commit
++     * its first page (and on x86-64 the syscall dispatcher page). The first page is later remapped MAP_SHARED, and
++     * no other allocation may share a host page with it (Obelisk: hosts whose pages are larger than 4 KiB cannot
++     * give a shared page and a private one different protections). */
++    {
++        void *usd_base = user_shared_data;
++        SIZE_T usd_size = 0x10000;
++
++        status = NtAllocateVirtualMemory( NtCurrentProcess(), &usd_base, 0, &usd_size,
++                                          MEM_RESERVE, PAGE_NOACCESS );
++        if (!status)
++            status = NtAllocateVirtualMemory( NtCurrentProcess(), (void **)&user_shared_data, 0, &data_size,
++                                              MEM_COMMIT, PAGE_READONLY );
++#ifdef __x86_64__
++        if (!status)
++        {
++            void *dispatcher_page = (char *)user_shared_data + USD_SYSCALL_DISPATCHER_OFFSET;
++            SIZE_T dispatcher_size = page_size;
++
++            status = NtAllocateVirtualMemory( NtCurrentProcess(), &dispatcher_page, 0, &dispatcher_size,
++                                              MEM_COMMIT, PAGE_READWRITE );
++        }
++#endif
++    }
+     if (status)
+     {
+         ERR( "wine: failed to map the shared user data: %08x\n", status );
+@@ -4747,6 +4804,11 @@ void virtual_map_user_shared_data(void)
+         ERR( "failed to open the USD section: %08x\n", status );
+         exit(1);
+     }
++    /* Obelisk: with a host page larger than 4 KiB, mprotect_range() gave the whole host page the protection of
++     * the committed USD page; the other pages of that host page are reserved PAGE_NOACCESS, make them PROT_NONE
++     * again so that the host can map the 4 KiB shared page next to them. */
++    if (host_page_size > page_size)
++        anon_mmap_fixed( (char *)user_shared_data + page_size, host_page_size - page_size, PROT_NONE, 0 );
+     if ((res = server_get_unix_fd( section, 0, &fd, &needs_close, NULL, NULL )) ||
+         (user_shared_data != mmap( user_shared_data, page_size, PROT_READ, MAP_SHARED|MAP_FIXED, fd, 0 )))
+     {
+diff --git a/dlls/win32u/class.c b/dlls/win32u/class.c
+index dc1a42b..a63f9bd 100644
+--- a/dlls/win32u/class.c
++++ b/dlls/win32u/class.c
+@@ -950,6 +950,7 @@ ULONG_PTR WINAPI NtUserSetClassLongPtr( HWND hwnd, INT offset, LONG_PTR newval,
+  */
+ WORD WINAPI NtUserSetClassWord( HWND hwnd, INT offset, WORD newval )
+ {
++    SYSCALL_SMALL_ARG( newval );
+     return set_class_long_size( hwnd, offset, newval, sizeof(WORD), TRUE );
+ }
+ 
+diff --git a/dlls/win32u/input.c b/dlls/win32u/input.c
+index 98d775f..f55b310 100644
+--- a/dlls/win32u/input.c
++++ b/dlls/win32u/input.c
+@@ -1098,6 +1098,7 @@ BOOL WINAPI NtUserSetKeyboardState( BYTE *state )
+  */
+ WORD WINAPI NtUserVkKeyScanEx( WCHAR chr, HKL layout )
+ {
++    SYSCALL_SMALL_ARG( chr );
+     const KBDTABLES *kbd_tables;
+     SHORT ret;
+ 
+diff --git a/dlls/win32u/opengl.c b/dlls/win32u/opengl.c
+index c7aeea1..0f73aa9 100644
+--- a/dlls/win32u/opengl.c
++++ b/dlls/win32u/opengl.c
+@@ -1600,6 +1600,29 @@ static void init_egl_platforms( struct opengl_funcs *funcs, const struct opengl_
+ 
+ #else /* SONAME_LIBEGL */
+ 
++struct framebuffer_surface
++{
++    struct opengl_drawable base;
++    struct opengl_drawable *target;
++};
++
++static const struct opengl_drawable_funcs framebuffer_surface_funcs;
++
++static inline struct framebuffer_surface *framebuffer_from_opengl_drawable( struct opengl_drawable *base )
++{
++    return CONTAINING_RECORD( base, struct framebuffer_surface, base );
++}
++
++static BOOL needs_framebuffer_surface( HWND hwnd )
++{
++    return FALSE;
++}
++
++static struct opengl_drawable *framebuffer_surface_create( int format, struct client_surface *client, struct opengl_drawable *target )
++{
++    return NULL;
++}
++
+ static BOOL egl_init( const struct opengl_driver_funcs **driver_funcs )
+ {
+     WARN( "EGL support not compiled in!\n" );
+diff --git a/dlls/win32u/palette.c b/dlls/win32u/palette.c
+index 4cf03b1..26a165d 100644
+--- a/dlls/win32u/palette.c
++++ b/dlls/win32u/palette.c
+@@ -508,6 +508,7 @@ static BOOL PALETTE_DeleteObject( HGDIOBJ handle )
+  */
+ HPALETTE WINAPI NtUserSelectPalette( HDC hdc, HPALETTE hpal, WORD bkg )
+ {
++    SYSCALL_SMALL_ARG( bkg );
+     BOOL is_primary = FALSE;
+     HPALETTE ret = 0;
+     DC *dc;
+@@ -626,6 +627,8 @@ BOOL WINAPI NtGdiSetMagicColors( HDC hdc, DWORD magic, ULONG index )
+ LONG WINAPI NtGdiDoPalette( HGDIOBJ handle, WORD start, WORD count, void *entries,
+                             DWORD func, BOOL inbound )
+ {
++    SYSCALL_SMALL_ARG( start );
++    SYSCALL_SMALL_ARG( count );
+     switch (func)
+     {
+     case NtGdiAnimatePalette:
+diff --git a/dlls/win32u/window.c b/dlls/win32u/window.c
+index f96a669..935a476 100644
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -1595,6 +1595,7 @@ LONG_PTR set_window_long( HWND hwnd, INT offset, UINT size, LONG_PTR newval, BOO
+  */
+ WORD WINAPI NtUserSetWindowWord( HWND hwnd, INT offset, WORD newval )
+ {
++    SYSCALL_SMALL_ARG( newval );
+     if (offset < 0 && offset != GWLP_USERDATA)
+     {
+         RtlSetLastWin32Error( ERROR_INVALID_INDEX );
+@@ -2575,6 +2576,7 @@ BOOL WINAPI NtUserGetLayeredWindowAttributes( HWND hwnd, COLORREF *key, BYTE *al
+  */
+ BOOL WINAPI NtUserSetLayeredWindowAttributes( HWND hwnd, COLORREF key, BYTE alpha, DWORD flags )
+ {
++    SYSCALL_SMALL_ARG( alpha );
+     BOOL ret;
+ 
+     TRACE( "(%p,%s,%d,%x)\n", hwnd, debugstr_color(key), alpha, flags );
+diff --git a/dlls/winebus.sys/Makefile.in b/dlls/winebus.sys/Makefile.in
+index db32fae..76b1126 100644
+--- a/dlls/winebus.sys/Makefile.in
++++ b/dlls/winebus.sys/Makefile.in
+@@ -8,6 +8,7 @@ EXTRADLLFLAGS = -Wl,--subsystem,native
+ 
+ SOURCES = \
+ 	bus_iohid.c \
++	bus_obelisk.c \
+ 	bus_sdl.c \
+ 	bus_udev.c \
+ 	hid.c \
+diff --git a/dlls/winebus.sys/main.c b/dlls/winebus.sys/main.c
+index 9d26eef..b2e19d9 100644
+--- a/dlls/winebus.sys/main.c
++++ b/dlls/winebus.sys/main.c
+@@ -1378,6 +1378,18 @@ static NTSTATUS iohid_driver_init(void)
+     return bus_main_thread_start(&bus);
+ }
+ 
++static NTSTATUS obelisk_driver_init(void)
++{
++    struct bus_main_params bus =
++    {
++        .name = L"Obelisk",
++        .init_code = obelisk_init,
++        .wait_code = obelisk_wait,
++    };
++
++    return bus_main_thread_start(&bus);
++}
++
+ static NTSTATUS fdo_pnp_dispatch(DEVICE_OBJECT *device, IRP *irp)
+ {
+     IO_STACK_LOCATION *irpsp = IoGetCurrentIrpStackLocation(irp);
+@@ -1396,6 +1408,7 @@ static NTSTATUS fdo_pnp_dispatch(DEVICE_OBJECT *device, IRP *irp)
+ 
+         udev_driver_init();
+         sdl_driver_init();
++        if (!obelisk_driver_init()) options.obelisk_gamepads = TRUE;
+         iohid_driver_init();
+ 
+         irp->IoStatus.Status = STATUS_SUCCESS;
+@@ -1407,6 +1420,7 @@ static NTSTATUS fdo_pnp_dispatch(DEVICE_OBJECT *device, IRP *irp)
+         winebus_call(sdl_stop, NULL);
+         winebus_call(udev_stop, NULL);
+         winebus_call(iohid_stop, NULL);
++        winebus_call(obelisk_stop, NULL);
+ 
+         WaitForMultipleObjects(bus_count, bus_thread, TRUE, INFINITE);
+         while (bus_count--) CloseHandle(bus_thread[bus_count]);
+diff --git a/dlls/winebus.sys/unix_private.h b/dlls/winebus.sys/unix_private.h
+index ba36971..a760502 100644
+--- a/dlls/winebus.sys/unix_private.h
++++ b/dlls/winebus.sys/unix_private.h
+@@ -234,6 +234,10 @@ extern NTSTATUS iohid_bus_init(void *);
+ extern NTSTATUS iohid_bus_wait(void *);
+ extern NTSTATUS iohid_bus_stop(void *);
+ 
++extern NTSTATUS obelisk_bus_init(void *);
++extern NTSTATUS obelisk_bus_wait(void *);
++extern NTSTATUS obelisk_bus_stop(void *);
++
+ extern void bus_event_cleanup(struct bus_event *event);
+ extern void bus_event_queue_destroy(struct list *queue);
+ extern BOOL bus_event_queue_device_removed(struct list *queue, struct unix_device *device);
+diff --git a/dlls/winebus.sys/unixlib.c b/dlls/winebus.sys/unixlib.c
+index bd4351f..71ee0e7 100644
+--- a/dlls/winebus.sys/unixlib.c
++++ b/dlls/winebus.sys/unixlib.c
+@@ -311,6 +311,9 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
+     iohid_bus_init,
+     iohid_bus_wait,
+     iohid_bus_stop,
++    obelisk_bus_init,
++    obelisk_bus_wait,
++    obelisk_bus_stop,
+     mouse_device_create,
+     keyboard_device_create,
+     unix_device_remove,
+diff --git a/dlls/winebus.sys/unixlib.h b/dlls/winebus.sys/unixlib.h
+index ad3b268..9db2415 100644
+--- a/dlls/winebus.sys/unixlib.h
++++ b/dlls/winebus.sys/unixlib.h
+@@ -65,6 +65,7 @@ struct bus_options
+     BOOL disable_udevd;
+     BOOL split_controllers;
+     BOOL map_controllers;
++    BOOL obelisk_gamepads; /* the Obelisk bus serves the gamepads */
+     UINT mappings_count;
+     struct list devices;
+     char **mappings;
+@@ -147,6 +148,9 @@ enum unix_funcs
+     iohid_init,
+     iohid_wait,
+     iohid_stop,
++    obelisk_init,
++    obelisk_wait,
++    obelisk_stop,
+     mouse_create,
+     keyboard_create,
+     device_remove,
+diff --git a/dlls/winedmo/libavcodec/pcm_byte_order_reverse_bsf.c b/dlls/winedmo/libavcodec/pcm_byte_order_reverse_bsf.c
+index 2237b1e..2af3dc4 100644
+--- a/dlls/winedmo/libavcodec/pcm_byte_order_reverse_bsf.c
++++ b/dlls/winedmo/libavcodec/pcm_byte_order_reverse_bsf.c
+@@ -24,7 +24,7 @@
+ #include "config.h"
+ #include "unix_private.h"
+ 
+-#ifdef HAVE_FFMPEG
++#if defined(HAVE_FFMPEG) && LIBAVCODEC_VERSION_MAJOR < 60
+ 
+ #define IS_EMPTY(pkt) (!(pkt)->data && !(pkt)->side_data_elems)
+ 
+diff --git a/dlls/winedmo/unix_demuxer.c b/dlls/winedmo/unix_demuxer.c
+index 7b749cd..a73ae0c 100644
+--- a/dlls/winedmo/unix_demuxer.c
++++ b/dlls/winedmo/unix_demuxer.c
+@@ -142,6 +142,7 @@ static NTSTATUS demuxer_create_streams( struct demuxer *demuxer )
+                 continue;
+             }
+         }
++#if LIBAVCODEC_VERSION_MAJOR < 60
+         else if (codec_is_big_endian_pcm(par->codec_id))
+         {
+             /* WAVEFORMATEX does not contain endianness info, so this needs to be converted here. */
+@@ -150,6 +151,7 @@ static NTSTATUS demuxer_create_streams( struct demuxer *demuxer )
+             av_bsf_init( stream->filter );
+             continue;
+         }
++#endif
+ 
+         av_bsf_get_null_filter( &stream->filter );
+         avcodec_parameters_copy( stream->filter->par_in, demuxer->ctx->streams[i]->codecpar );
+diff --git a/include/wine/asm.h b/include/wine/asm.h
+index 172d7c8..f6dfaf8 100644
+--- a/include/wine/asm.h
++++ b/include/wine/asm.h
+@@ -296,8 +296,8 @@
+                        ".byte 0xc3\n\t"           /* 14: ret */ \
+                        ".byte 0xeb,0x01\n\t"      /* 15: jmp 18 */ \
+                        ".byte 0xc3\n\t"           /* 17: ret */ \
+-                       ".byte 0xff,0x14,0x25\n\t" /* 18: callq *(0x7ffe1000) */ \
+-                       ".long 0x7ffe1000\n\t" \
++                       ".byte 0xff,0x14,0x25\n\t" /* 18: callq *(0x7ffe4000) */ \
++                       ".long 0x7ffe4000\n\t" \
+                        ".byte 0xc3" )             /* 1f: ret */
+ #elif defined __arm__
+ # define __ASM_SYSCALL_FUNC(id,name,args) \
+diff --git a/include/wine/server_protocol.h b/include/wine/server_protocol.h
+index d908717..5e6014e 100644
+--- a/include/wine/server_protocol.h
++++ b/include/wine/server_protocol.h
+@@ -139,7 +139,7 @@ struct context_data
+         struct { unsigned __int64 rax, rbx, rcx, rdx, rbp, rsi, rdi,
+                                   r8, r9, r10, r11, r12, r13, r14, r15; } x86_64_regs;
+         struct { unsigned int r[13]; } arm_regs;
+-        struct { unsigned __int64 x[31]; } arm64_regs;
++        struct { unsigned __int64 x0[18], x19[12]; } arm64_regs;
+     } integer;
+     union
+     {
+@@ -152,7 +152,7 @@ struct context_data
+                  unsigned char regs[80]; } i386_regs;
+         struct { struct { unsigned __int64 low, high; } fpregs[32]; } x86_64_regs;
+         struct { unsigned __int64 d[32]; unsigned int fpscr; } arm_regs;
+-        struct { struct { unsigned __int64 low, high; } q[32]; unsigned int fpcr, fpsr; } arm64_regs;
++        struct { struct { unsigned __int64 low, high; } q[16]; unsigned int fpcr, fpsr; } arm64_regs;
+     } fp;
+     union
+     {
+@@ -171,18 +171,24 @@ struct context_data
+     } exec_space;
+     union
+     {
+-        struct { struct { unsigned __int64 low, high; } ymm_high[16]; } regs;
+-    } ymm;
++        struct { struct { unsigned __int64 low, high; } ymm_high[16]; } ymm_regs;
++        struct { struct { unsigned __int64 low, high; } q16[16]; } arm64_regs;
++    } vector;
++    union
++    {
++        unsigned __int64 arm64_x18;
++    } tls;
+ };
+ 
+-#define SERVER_CTX_CONTROL            0x01
+-#define SERVER_CTX_INTEGER            0x02
+-#define SERVER_CTX_SEGMENTS           0x04
+-#define SERVER_CTX_FLOATING_POINT     0x08
+-#define SERVER_CTX_DEBUG_REGISTERS    0x10
+-#define SERVER_CTX_EXTENDED_REGISTERS 0x20
+-#define SERVER_CTX_YMM_REGISTERS      0x40
+-#define SERVER_CTX_EXEC_SPACE         0x80
++#define SERVER_CTX_CONTROL            0x0001
++#define SERVER_CTX_INTEGER            0x0002
++#define SERVER_CTX_SEGMENTS           0x0004
++#define SERVER_CTX_FLOATING_POINT     0x0008
++#define SERVER_CTX_DEBUG_REGISTERS    0x0010
++#define SERVER_CTX_EXTENDED_REGISTERS 0x0020
++#define SERVER_CTX_VECTOR_REGISTERS   0x0040
++#define SERVER_CTX_EXEC_SPACE         0x0080
++#define SERVER_CTX_TLS                0x0100
+ 
+ 
+ struct send_fd
+@@ -977,6 +983,12 @@ struct obj_locator
+ #define WH_WINEVENT      (WH_MAXHOOK + 1)
+ #define NB_HOOKS         (WH_WINEVENT - WH_MINHOOK + 1)
+ 
++struct directory_file_entry
++{
++    data_size_t name_len;
++
++};
++
+ struct shared_cursor
+ {
+     int                  x;
+@@ -1148,6 +1160,13 @@ struct get_startup_info_reply
+ };
+ 
+ 
++struct cpu_topology_override
++{
++    unsigned int cpu_count;
++    unsigned char host_cpu_id[64];
++};
++
++
+ 
+ struct init_process_done_request
+ {
+@@ -1155,6 +1174,7 @@ struct init_process_done_request
+     char __pad_12[4];
+     client_ptr_t teb;
+     client_ptr_t peb;
++    client_ptr_t ldt_copy;
+ };
+ struct init_process_done_reply
+ {
+@@ -1173,6 +1193,7 @@ struct init_first_thread_request
+     int          debug_level;
+     int          reply_fd;
+     int          wait_fd;
++    /* VARARG(cpu_override,cpu_topology_override); */
+ };
+ struct init_first_thread_reply
+ {
+@@ -1391,25 +1412,27 @@ struct set_thread_info_request
+     int          priority;
+     int          base_priority;
+     affinity_t   affinity;
++    affinity_t   system_affinity;
+     client_ptr_t entry_point;
+     obj_handle_t token;
+     int          disable_boost;
+     unsigned int mask;
+     /* VARARG(desc,unicode_str); */
+-    char __pad_52[4];
++    char __pad_60[4];
+ };
+ struct set_thread_info_reply
+ {
+     struct reply_header __header;
+ };
+-#define SET_THREAD_INFO_PRIORITY        0x01
+-#define SET_THREAD_INFO_BASE_PRIORITY   0x02
+-#define SET_THREAD_INFO_AFFINITY        0x04
+-#define SET_THREAD_INFO_TOKEN           0x08
+-#define SET_THREAD_INFO_ENTRYPOINT      0x10
+-#define SET_THREAD_INFO_DESCRIPTION     0x20
+-#define SET_THREAD_INFO_DBG_HIDDEN      0x40
+-#define SET_THREAD_INFO_DISABLE_BOOST   0x80
++#define SET_THREAD_INFO_PRIORITY        0x001
++#define SET_THREAD_INFO_BASE_PRIORITY   0x002
++#define SET_THREAD_INFO_AFFINITY        0x004
++#define SET_THREAD_INFO_GROUP_AFFINITY  0x008
++#define SET_THREAD_INFO_TOKEN           0x010
++#define SET_THREAD_INFO_ENTRYPOINT      0x020
++#define SET_THREAD_INFO_DESCRIPTION     0x040
++#define SET_THREAD_INFO_DBG_HIDDEN      0x080
++#define SET_THREAD_INFO_DISABLE_BOOST   0x100
+ 
+ 
+ 
+@@ -1417,12 +1440,14 @@ struct suspend_thread_request
+ {
+     struct request_header __header;
+     obj_handle_t handle;
++    obj_handle_t waited_handle;
++    char __pad_20[4];
+ };
+ struct suspend_thread_reply
+ {
+     struct reply_header __header;
+     int          count;
+-    char __pad_12[4];
++    obj_handle_t wait_handle;
+ };
+ 
+ 
+@@ -2606,6 +2631,25 @@ struct flush_key_request
+     obj_handle_t hkey;
+ };
+ struct flush_key_reply
++{
++    struct reply_header __header;
++    abstime_t   timestamp_counter;
++    data_size_t total;
++    int         branch_count;
++    /* VARARG(data,bytes); */
++};
++
++
++
++struct flush_key_done_request
++{
++    struct request_header __header;
++    char __pad_12[4];
++    abstime_t    timestamp_counter;
++    int          branch;
++    char __pad_28[4];
++};
++struct flush_key_done_reply
+ {
+     struct reply_header __header;
+ };
+@@ -2734,12 +2778,19 @@ struct save_registry_request
+ {
+     struct request_header __header;
+     obj_handle_t hkey;
+-    obj_handle_t file;
+-    char __pad_20[4];
+ };
+ struct save_registry_reply
+ {
+     struct reply_header __header;
++    data_size_t  total;
++    /* VARARG(data,bytes); */
++    char __pad_12[4];
++};
++enum prefix_type
++{
++    PREFIX_UNKNOWN,
++    PREFIX_32BIT,
++    PREFIX_64BIT,
+ };
+ 
+ 
+@@ -3125,7 +3176,22 @@ struct send_hardware_message_reply
+     int             new_y;
+     char __pad_28[4];
+ };
+-#define SEND_HWMSG_INJECTED    0x01
++
++
++
++struct track_mouse_from_pointer_request
++{
++    struct request_header __header;
++    user_handle_t   win;
++    unsigned int    msg;
++    unsigned int    pointer_id;
++};
++struct track_mouse_from_pointer_reply
++{
++    struct reply_header __header;
++    int             cursor_pos_updated;
++    char __pad_12[4];
++};
+ 
+ 
+ 
+@@ -4168,6 +4234,7 @@ struct set_user_object_info_request
+     obj_handle_t handle;
+     unsigned int flags;
+     unsigned int obj_flags;
++    timeout_t    close_timeout;
+ };
+ struct set_user_object_info_reply
+ {
+@@ -4178,6 +4245,7 @@ struct set_user_object_info_reply
+ };
+ #define SET_USER_OBJECT_SET_FLAGS       1
+ #define SET_USER_OBJECT_GET_FULL_NAME   2
++#define SET_USER_OBJECT_SET_CLOSE_TIMEOUT 4
+ 
+ 
+ 
+@@ -4244,12 +4312,12 @@ struct get_thread_input_reply
+ 
+ 
+ 
+-struct get_last_input_time_request
++struct set_user_input_time_request
+ {
+     struct request_header __header;
+-    char __pad_12[4];
++    int          set;
+ };
+-struct get_last_input_time_reply
++struct set_user_input_time_reply
+ {
+     struct reply_header __header;
+     unsigned int time;
+@@ -4994,11 +5062,13 @@ struct get_security_object_reply
+ 
+ struct handle_info
+ {
++    client_ptr_t object;
+     process_id_t owner;
+     obj_handle_t handle;
+     unsigned int access;
+     unsigned int attributes;
+     unsigned int type;
++    unsigned int __pad;
+ };
+ 
+ 
+@@ -5133,6 +5203,20 @@ struct get_directory_entries_reply
+     /* VARARG(entries,directory_entries); */
+ };
+ 
++struct query_directory_file_request
++{
++    struct request_header __header;
++    obj_handle_t   handle;
++    unsigned int   restart_scan;
++    char __pad_20[4];
++};
++struct query_directory_file_reply
++{
++    struct reply_header __header;
++    data_size_t    total_len;
++    /* VARARG(entries,directory_file_entries); */
++    char __pad_12[4];
++};
+ 
+ 
+ struct create_symlink_request
+@@ -5404,6 +5488,7 @@ struct make_process_system_request
+ {
+     struct request_header __header;
+     obj_handle_t handle;
++    timeout_t    desktop_close_timeout;
+ };
+ struct make_process_system_reply
+ {
+@@ -6000,6 +6085,8 @@ struct get_inproc_sync_fd_reply
+     struct reply_header __header;
+     int           type;
+     unsigned int access;
++    unsigned int fsync_shm_idx;
++    char __pad_20[4];
+ };
+ 
+ 
+@@ -6013,7 +6100,7 @@ struct get_inproc_alert_fd_reply
+ {
+     struct reply_header __header;
+     obj_handle_t handle;
+-    char __pad_12[4];
++    unsigned int fsync_shm_idx;
+ };
+ 
+ 
+@@ -6160,6 +6247,31 @@ struct d3dkmt_mutex_release_reply
+ };
+ 
+ 
++#define FSYNC_SHM_PAGE_SIZE 0x10000
++#define FSYNC_USED_BY_SERVER 0x7eadfeef
++
++enum fsync_type
++{
++    FSYNC_SEMAPHORE = 1,
++    FSYNC_AUTO_EVENT,
++    FSYNC_MANUAL_EVENT,
++    FSYNC_MUTEX,
++    FSYNC_AUTO_SERVER,
++    FSYNC_MANUAL_SERVER,
++    FSYNC_QUEUE,
++};
++
++struct fsync_free_shm_idx_request
++{
++    struct request_header __header;
++    unsigned int shm_idx;
++};
++struct fsync_free_shm_idx_reply
++{
++    struct reply_header __header;
++};
++
++
+ enum request
+ {
+     REQ_new_process,
+@@ -6252,6 +6364,7 @@ enum request
+     REQ_open_key,
+     REQ_delete_key,
+     REQ_flush_key,
++    REQ_flush_key_done,
+     REQ_enum_key,
+     REQ_set_key_value,
+     REQ_get_key_value,
+@@ -6284,6 +6397,7 @@ enum request
+     REQ_send_message,
+     REQ_post_quit_message,
+     REQ_send_hardware_message,
++    REQ_track_mouse_from_pointer,
+     REQ_get_message,
+     REQ_reply_message,
+     REQ_accept_hardware_message,
+@@ -6351,7 +6465,7 @@ enum request
+     REQ_unregister_hotkey,
+     REQ_attach_thread_input,
+     REQ_get_thread_input,
+-    REQ_get_last_input_time,
++    REQ_set_user_input_time,
+     REQ_get_key_state,
+     REQ_set_key_state,
+     REQ_set_foreground_window,
+@@ -6404,6 +6518,7 @@ enum request
+     REQ_create_directory,
+     REQ_open_directory,
+     REQ_get_directory_entries,
++    REQ_query_directory_file,
+     REQ_create_symlink,
+     REQ_open_symlink,
+     REQ_query_symlink,
+@@ -6468,6 +6583,7 @@ enum request
+     REQ_d3dkmt_object_open_name,
+     REQ_d3dkmt_mutex_acquire,
+     REQ_d3dkmt_mutex_release,
++    REQ_fsync_free_shm_idx,
+     REQ_NB_REQUESTS
+ };
+ 
+@@ -6565,6 +6681,7 @@ union generic_request
+     struct open_key_request open_key_request;
+     struct delete_key_request delete_key_request;
+     struct flush_key_request flush_key_request;
++    struct flush_key_done_request flush_key_done_request;
+     struct enum_key_request enum_key_request;
+     struct set_key_value_request set_key_value_request;
+     struct get_key_value_request get_key_value_request;
+@@ -6597,6 +6714,7 @@ union generic_request
+     struct send_message_request send_message_request;
+     struct post_quit_message_request post_quit_message_request;
+     struct send_hardware_message_request send_hardware_message_request;
++    struct track_mouse_from_pointer_request track_mouse_from_pointer_request;
+     struct get_message_request get_message_request;
+     struct reply_message_request reply_message_request;
+     struct accept_hardware_message_request accept_hardware_message_request;
+@@ -6664,7 +6782,7 @@ union generic_request
+     struct unregister_hotkey_request unregister_hotkey_request;
+     struct attach_thread_input_request attach_thread_input_request;
+     struct get_thread_input_request get_thread_input_request;
+-    struct get_last_input_time_request get_last_input_time_request;
++    struct set_user_input_time_request set_user_input_time_request;
+     struct get_key_state_request get_key_state_request;
+     struct set_key_state_request set_key_state_request;
+     struct set_foreground_window_request set_foreground_window_request;
+@@ -6717,6 +6835,7 @@ union generic_request
+     struct create_directory_request create_directory_request;
+     struct open_directory_request open_directory_request;
+     struct get_directory_entries_request get_directory_entries_request;
++    struct query_directory_file_request query_directory_file_request;
+     struct create_symlink_request create_symlink_request;
+     struct open_symlink_request open_symlink_request;
+     struct query_symlink_request query_symlink_request;
+@@ -6781,6 +6900,7 @@ union generic_request
+     struct d3dkmt_object_open_name_request d3dkmt_object_open_name_request;
+     struct d3dkmt_mutex_acquire_request d3dkmt_mutex_acquire_request;
+     struct d3dkmt_mutex_release_request d3dkmt_mutex_release_request;
++    struct fsync_free_shm_idx_request fsync_free_shm_idx_request;
+ };
+ union generic_reply
+ {
+@@ -6876,6 +6996,7 @@ union generic_reply
+     struct open_key_reply open_key_reply;
+     struct delete_key_reply delete_key_reply;
+     struct flush_key_reply flush_key_reply;
++    struct flush_key_done_reply flush_key_done_reply;
+     struct enum_key_reply enum_key_reply;
+     struct set_key_value_reply set_key_value_reply;
+     struct get_key_value_reply get_key_value_reply;
+@@ -6908,6 +7029,7 @@ union generic_reply
+     struct send_message_reply send_message_reply;
+     struct post_quit_message_reply post_quit_message_reply;
+     struct send_hardware_message_reply send_hardware_message_reply;
++    struct track_mouse_from_pointer_reply track_mouse_from_pointer_reply;
+     struct get_message_reply get_message_reply;
+     struct reply_message_reply reply_message_reply;
+     struct accept_hardware_message_reply accept_hardware_message_reply;
+@@ -6975,7 +7097,7 @@ union generic_reply
+     struct unregister_hotkey_reply unregister_hotkey_reply;
+     struct attach_thread_input_reply attach_thread_input_reply;
+     struct get_thread_input_reply get_thread_input_reply;
+-    struct get_last_input_time_reply get_last_input_time_reply;
++    struct set_user_input_time_reply set_user_input_time_reply;
+     struct get_key_state_reply get_key_state_reply;
+     struct set_key_state_reply set_key_state_reply;
+     struct set_foreground_window_reply set_foreground_window_reply;
+@@ -7028,6 +7150,7 @@ union generic_reply
+     struct create_directory_reply create_directory_reply;
+     struct open_directory_reply open_directory_reply;
+     struct get_directory_entries_reply get_directory_entries_reply;
++    struct query_directory_file_reply query_directory_file_reply;
+     struct create_symlink_reply create_symlink_reply;
+     struct open_symlink_reply open_symlink_reply;
+     struct query_symlink_reply query_symlink_reply;
+@@ -7092,8 +7215,9 @@ union generic_reply
+     struct d3dkmt_object_open_name_reply d3dkmt_object_open_name_reply;
+     struct d3dkmt_mutex_acquire_reply d3dkmt_mutex_acquire_reply;
+     struct d3dkmt_mutex_release_reply d3dkmt_mutex_release_reply;
++    struct fsync_free_shm_idx_reply fsync_free_shm_idx_reply;
+ };
+ 
+-#define SERVER_PROTOCOL_VERSION 930
++#define SERVER_PROTOCOL_VERSION 931
+ 
+ #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
+diff --git a/include/wine/unixlib.h b/include/wine/unixlib.h
+index 77f9c7c..87a27e9 100644
+--- a/include/wine/unixlib.h
++++ b/include/wine/unixlib.h
+@@ -37,6 +37,15 @@ typedef NTSTATUS (*unixlib_entry_t)( void *args );
+ extern DECLSPEC_EXPORT const unixlib_entry_t __wine_unix_call_funcs[];
+ extern DECLSPEC_EXPORT const unixlib_entry_t __wine_unix_call_wow64_funcs[];
+ 
++/* A Windows caller sets only the low bytes of a system call argument smaller
++ * than 32 bits, such as a BOOLEAN, and the syscall dispatcher copies the whole
++ * register or stack slot. Clang assumes the caller extended it, and so reads
++ * the stale bytes too: a FALSE restart flag could read as TRUE. Re-read the
++ * argument through memory, which keeps only its own bytes. This is a
++ * declaration, so it may come first in a function body. */
++#define SYSCALL_SMALL_ARG(arg) \
++    __attribute__((unused)) const int arg##_small_arg = (int)((arg) = *(volatile __typeof__(arg) *)&(arg))
++
+ /* some useful private helpers from ntdll */
+ 
+ #ifdef __WINESRC__
+diff --git a/programs/explorer/desktop.c b/programs/explorer/desktop.c
+index c4189cb..61ebc9f 100644
+--- a/programs/explorer/desktop.c
++++ b/programs/explorer/desktop.c
+@@ -40,7 +40,8 @@ WINE_DEFAULT_DEBUG_CHANNEL(explorer);
+ #define DESKTOP_CLASS_ATOM ((LPCWSTR)MAKEINTATOM(32769))
+ #define DESKTOP_ALL_ACCESS 0x01ff
+ 
+-static const WCHAR default_driver[] = L"mac,x11,wayland";
++/* Obelisk: the wsd display driver first */
++static const WCHAR default_driver[] = L"obelisk,mac,x11,wayland";
+ 
+ static BOOL using_root = TRUE;
+ 
+diff --git a/server/mapping.c b/server/mapping.c
+index b9b1b63..e856398 100644
+--- a/server/mapping.c
++++ b/server/mapping.c
+@@ -297,6 +297,12 @@ static void free_available_high_map_addr( client_ptr_t base, mem_size_t size )
+ void init_memory(void)
+ {
+     host_page_mask = sysconf( _SC_PAGESIZE ) - 1;
++    {
++        /* Obelisk: same override as ntdll's virtual.c, for hosts whose hardware page is larger than the guest's */
++        const char *env = getenv( "WINE_HOST_PAGE_SIZE" );
++        size_t size = env ? strtoul( env, NULL, 0 ) : 0;
++        if (size > host_page_mask + 1 && size <= 0x10000 && !(size & (size - 1))) host_page_mask = size - 1;
++    }
+     free_map_addr( 0x60000000, 0x1c000000 );
+     free_available_high_map_addr( 0x600000000000, 0x100000000000 );
+ }
+@@ -673,7 +679,9 @@ static int build_shared_mapping( struct mapping *mapping, size_t align_mask, int
+         {
+             get_section_sizes( &sec[i], align_mask, &map_size, &read_pos, &file_size );
+             if (file_size > max_size) max_size = file_size;
+-            total_size += map_size;
++            /* Obelisk: each shared section sits in the temp file at its own RVA (sparse file), so that file offset
++             * and address are congruent modulo any host page size (16 KiB hosts cannot mmap them otherwise) */
++            total_size = max( total_size, (mem_size_t)sec[i].VirtualAddress + map_size );
+         }
+     }
+     if (!total_size) return 1;  /* nothing to do */
+@@ -695,7 +703,7 @@ static int build_shared_mapping( struct mapping *mapping, size_t align_mask, int
+         if (!(sec[i].Characteristics & IMAGE_SCN_MEM_SHARED)) continue;
+         if (!(sec[i].Characteristics & IMAGE_SCN_MEM_WRITE)) continue;
+         get_section_sizes( &sec[i], align_mask, &map_size, &read_pos, &file_size );
+-        write_pos = shared_pos;
++        write_pos = sec[i].VirtualAddress;  /* Obelisk: see above */
+         shared_pos += map_size;
+         if (!sec[i].PointerToRawData || !file_size) continue;
+         toread = file_size;
+@@ -1377,7 +1385,10 @@ struct mapping *create_session_mapping( struct object *root, const struct unicod
+     static const unsigned int access = FILE_READ_DATA | FILE_WRITE_DATA;
+     size_t size = max( sizeof(*shared_session) + sizeof(object_shm_t) * 512, 0x10000 );
+ 
+-    size = round_size( size, host_page_mask );
++    /* Obelisk: the session mapping is mapped MAP_SHARED by every client; keep its size and every growth step a
++     * multiple of the 64 KiB allocation granularity so that no view of it ends inside a larger (16 KiB) host page
++     * shared with a private allocation. */
++    size = round_size( size, 0xffff );
+     return create_mapping( root, name, attr, size, SEC_COMMIT, 0, access, sd );
+ }
+ 
+@@ -1413,7 +1424,7 @@ static struct session_block *grow_session_mapping( mem_size_t needed )
+     void *tmp;
+ 
+     new_size = max( old_size * 3 / 2, old_size + max( needed, 0x10000 ) );
+-    new_size = round_size( new_size, host_page_mask );
++    new_size = round_size( new_size, 0xffff );  /* Obelisk: see create_session_mapping */
+     assert( new_size > old_size );
+ 
+     unix_fd = get_unix_fd( session_mapping->fd );
+diff --git a/server/request_handlers.h b/server/request_handlers.h
+index f54963f..3b08e35 100644
+--- a/server/request_handlers.h
++++ b/server/request_handlers.h
+@@ -97,6 +97,7 @@ DECL_HANDLER(create_key);
+ DECL_HANDLER(open_key);
+ DECL_HANDLER(delete_key);
+ DECL_HANDLER(flush_key);
++DECL_HANDLER(flush_key_done);
+ DECL_HANDLER(enum_key);
+ DECL_HANDLER(set_key_value);
+ DECL_HANDLER(get_key_value);
+@@ -129,6 +130,7 @@ DECL_HANDLER(get_process_idle_event);
+ DECL_HANDLER(send_message);
+ DECL_HANDLER(post_quit_message);
+ DECL_HANDLER(send_hardware_message);
++DECL_HANDLER(track_mouse_from_pointer);
+ DECL_HANDLER(get_message);
+ DECL_HANDLER(reply_message);
+ DECL_HANDLER(accept_hardware_message);
+@@ -196,7 +198,7 @@ DECL_HANDLER(register_hotkey);
+ DECL_HANDLER(unregister_hotkey);
+ DECL_HANDLER(attach_thread_input);
+ DECL_HANDLER(get_thread_input);
+-DECL_HANDLER(get_last_input_time);
++DECL_HANDLER(set_user_input_time);
+ DECL_HANDLER(get_key_state);
+ DECL_HANDLER(set_key_state);
+ DECL_HANDLER(set_foreground_window);
+@@ -249,6 +251,7 @@ DECL_HANDLER(set_mailslot_info);
+ DECL_HANDLER(create_directory);
+ DECL_HANDLER(open_directory);
+ DECL_HANDLER(get_directory_entries);
++DECL_HANDLER(query_directory_file);
+ DECL_HANDLER(create_symlink);
+ DECL_HANDLER(open_symlink);
+ DECL_HANDLER(query_symlink);
+@@ -313,6 +316,7 @@ DECL_HANDLER(d3dkmt_share_objects);
+ DECL_HANDLER(d3dkmt_object_open_name);
+ DECL_HANDLER(d3dkmt_mutex_acquire);
+ DECL_HANDLER(d3dkmt_mutex_release);
++DECL_HANDLER(fsync_free_shm_idx);
+ 
+ typedef void (*req_handler)( const void *req, void *reply );
+ static const req_handler req_handlers[REQ_NB_REQUESTS] =
+@@ -407,6 +411,7 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
+     (req_handler)req_open_key,
+     (req_handler)req_delete_key,
+     (req_handler)req_flush_key,
++    (req_handler)req_flush_key_done,
+     (req_handler)req_enum_key,
+     (req_handler)req_set_key_value,
+     (req_handler)req_get_key_value,
+@@ -439,6 +444,7 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
+     (req_handler)req_send_message,
+     (req_handler)req_post_quit_message,
+     (req_handler)req_send_hardware_message,
++    (req_handler)req_track_mouse_from_pointer,
+     (req_handler)req_get_message,
+     (req_handler)req_reply_message,
+     (req_handler)req_accept_hardware_message,
+@@ -506,7 +512,7 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
+     (req_handler)req_unregister_hotkey,
+     (req_handler)req_attach_thread_input,
+     (req_handler)req_get_thread_input,
+-    (req_handler)req_get_last_input_time,
++    (req_handler)req_set_user_input_time,
+     (req_handler)req_get_key_state,
+     (req_handler)req_set_key_state,
+     (req_handler)req_set_foreground_window,
+@@ -559,6 +565,7 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
+     (req_handler)req_create_directory,
+     (req_handler)req_open_directory,
+     (req_handler)req_get_directory_entries,
++    (req_handler)req_query_directory_file,
+     (req_handler)req_create_symlink,
+     (req_handler)req_open_symlink,
+     (req_handler)req_query_symlink,
+@@ -623,6 +630,7 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
+     (req_handler)req_d3dkmt_object_open_name,
+     (req_handler)req_d3dkmt_mutex_acquire,
+     (req_handler)req_d3dkmt_mutex_release,
++    (req_handler)req_fsync_free_shm_idx,
+ };
+ 
+ C_ASSERT( sizeof(abstime_t) == 8 );
+@@ -644,11 +652,11 @@ C_ASSERT( sizeof(object_id_t) == 8 );
+ C_ASSERT( sizeof(process_id_t) == 4 );
+ C_ASSERT( sizeof(short int) == 2 );
+ C_ASSERT( sizeof(struct async_data) == 40 );
+-C_ASSERT( sizeof(struct context_data) == 1720 );
++C_ASSERT( sizeof(struct context_data) == 1712 );
+ C_ASSERT( sizeof(struct cursor_pos) == 24 );
+ C_ASSERT( sizeof(struct filesystem_event) == 12 );
+ C_ASSERT( sizeof(struct generic_map) == 16 );
+-C_ASSERT( sizeof(struct handle_info) == 20 );
++C_ASSERT( sizeof(struct handle_info) == 32 );
+ C_ASSERT( sizeof(struct luid) == 8 );
+ C_ASSERT( sizeof(struct luid_attr) == 12 );
+ C_ASSERT( sizeof(struct obj_locator) == 16 );
+@@ -712,7 +720,8 @@ C_ASSERT( offsetof(struct get_startup_info_reply, machine) == 12 );
+ C_ASSERT( sizeof(struct get_startup_info_reply) == 16 );
+ C_ASSERT( offsetof(struct init_process_done_request, teb) == 16 );
+ C_ASSERT( offsetof(struct init_process_done_request, peb) == 24 );
+-C_ASSERT( sizeof(struct init_process_done_request) == 32 );
++C_ASSERT( offsetof(struct init_process_done_request, ldt_copy) == 32 );
++C_ASSERT( sizeof(struct init_process_done_request) == 40 );
+ C_ASSERT( offsetof(struct init_process_done_reply, suspend) == 8 );
+ C_ASSERT( sizeof(struct init_process_done_reply) == 16 );
+ C_ASSERT( offsetof(struct init_first_thread_request, unix_pid) == 12 );
+@@ -822,8 +831,10 @@ C_ASSERT( offsetof(struct set_thread_info_request, disable_boost) == 52 );
+ C_ASSERT( offsetof(struct set_thread_info_request, mask) == 56 );
+ C_ASSERT( sizeof(struct set_thread_info_request) == 64 );
+ C_ASSERT( offsetof(struct suspend_thread_request, handle) == 12 );
+-C_ASSERT( sizeof(struct suspend_thread_request) == 16 );
++C_ASSERT( offsetof(struct suspend_thread_request, waited_handle) == 16 );
++C_ASSERT( sizeof(struct suspend_thread_request) == 24 );
+ C_ASSERT( offsetof(struct suspend_thread_reply, count) == 8 );
++C_ASSERT( offsetof(struct suspend_thread_reply, wait_handle) == 12 );
+ C_ASSERT( sizeof(struct suspend_thread_reply) == 16 );
+ C_ASSERT( offsetof(struct resume_thread_request, handle) == 12 );
+ C_ASSERT( sizeof(struct resume_thread_request) == 16 );
+@@ -1203,6 +1214,13 @@ C_ASSERT( offsetof(struct delete_key_request, hkey) == 12 );
+ C_ASSERT( sizeof(struct delete_key_request) == 16 );
+ C_ASSERT( offsetof(struct flush_key_request, hkey) == 12 );
+ C_ASSERT( sizeof(struct flush_key_request) == 16 );
++C_ASSERT( offsetof(struct flush_key_reply, timestamp_counter) == 8 );
++C_ASSERT( offsetof(struct flush_key_reply, total) == 16 );
++C_ASSERT( offsetof(struct flush_key_reply, branch_count) == 20 );
++C_ASSERT( sizeof(struct flush_key_reply) == 24 );
++C_ASSERT( offsetof(struct flush_key_done_request, timestamp_counter) == 16 );
++C_ASSERT( offsetof(struct flush_key_done_request, branch) == 24 );
++C_ASSERT( sizeof(struct flush_key_done_request) == 32 );
+ C_ASSERT( offsetof(struct enum_key_request, hkey) == 12 );
+ C_ASSERT( offsetof(struct enum_key_request, index) == 16 );
+ C_ASSERT( offsetof(struct enum_key_request, info_class) == 20 );
+@@ -1242,8 +1260,9 @@ C_ASSERT( offsetof(struct unload_registry_request, parent) == 12 );
+ C_ASSERT( offsetof(struct unload_registry_request, attributes) == 16 );
+ C_ASSERT( sizeof(struct unload_registry_request) == 24 );
+ C_ASSERT( offsetof(struct save_registry_request, hkey) == 12 );
+-C_ASSERT( offsetof(struct save_registry_request, file) == 16 );
+-C_ASSERT( sizeof(struct save_registry_request) == 24 );
++C_ASSERT( sizeof(struct save_registry_request) == 16 );
++C_ASSERT( offsetof(struct save_registry_reply, total) == 8 );
++C_ASSERT( sizeof(struct save_registry_reply) == 16 );
+ C_ASSERT( offsetof(struct set_registry_notification_request, hkey) == 12 );
+ C_ASSERT( offsetof(struct set_registry_notification_request, event) == 16 );
+ C_ASSERT( offsetof(struct set_registry_notification_request, subtree) == 20 );
+@@ -1360,6 +1379,12 @@ C_ASSERT( offsetof(struct send_hardware_message_reply, prev_y) == 16 );
+ C_ASSERT( offsetof(struct send_hardware_message_reply, new_x) == 20 );
+ C_ASSERT( offsetof(struct send_hardware_message_reply, new_y) == 24 );
+ C_ASSERT( sizeof(struct send_hardware_message_reply) == 32 );
++C_ASSERT( offsetof(struct track_mouse_from_pointer_request, win) == 12 );
++C_ASSERT( offsetof(struct track_mouse_from_pointer_request, msg) == 16 );
++C_ASSERT( offsetof(struct track_mouse_from_pointer_request, pointer_id) == 20 );
++C_ASSERT( sizeof(struct track_mouse_from_pointer_request) == 24 );
++C_ASSERT( offsetof(struct track_mouse_from_pointer_reply, cursor_pos_updated) == 8 );
++C_ASSERT( sizeof(struct track_mouse_from_pointer_reply) == 16 );
+ C_ASSERT( offsetof(struct get_message_request, flags) == 12 );
+ C_ASSERT( offsetof(struct get_message_request, get_win) == 16 );
+ C_ASSERT( offsetof(struct get_message_request, get_first) == 20 );
+@@ -1712,7 +1737,8 @@ C_ASSERT( sizeof(struct set_thread_desktop_reply) == 24 );
+ C_ASSERT( offsetof(struct set_user_object_info_request, handle) == 12 );
+ C_ASSERT( offsetof(struct set_user_object_info_request, flags) == 16 );
+ C_ASSERT( offsetof(struct set_user_object_info_request, obj_flags) == 20 );
+-C_ASSERT( sizeof(struct set_user_object_info_request) == 24 );
++C_ASSERT( offsetof(struct set_user_object_info_request, close_timeout) == 24 );
++C_ASSERT( sizeof(struct set_user_object_info_request) == 32 );
+ C_ASSERT( offsetof(struct set_user_object_info_reply, is_desktop) == 8 );
+ C_ASSERT( offsetof(struct set_user_object_info_reply, old_obj_flags) == 12 );
+ C_ASSERT( sizeof(struct set_user_object_info_reply) == 16 );
+@@ -1739,9 +1765,10 @@ C_ASSERT( offsetof(struct get_thread_input_request, tid) == 12 );
+ C_ASSERT( sizeof(struct get_thread_input_request) == 16 );
+ C_ASSERT( offsetof(struct get_thread_input_reply, locator) == 8 );
+ C_ASSERT( sizeof(struct get_thread_input_reply) == 24 );
+-C_ASSERT( sizeof(struct get_last_input_time_request) == 16 );
+-C_ASSERT( offsetof(struct get_last_input_time_reply, time) == 8 );
+-C_ASSERT( sizeof(struct get_last_input_time_reply) == 16 );
++C_ASSERT( offsetof(struct set_user_input_time_request, set) == 12 );
++C_ASSERT( sizeof(struct set_user_input_time_request) == 16 );
++C_ASSERT( offsetof(struct set_user_input_time_reply, time) == 8 );
++C_ASSERT( sizeof(struct set_user_input_time_reply) == 16 );
+ C_ASSERT( offsetof(struct get_key_state_request, async) == 12 );
+ C_ASSERT( offsetof(struct get_key_state_request, key) == 16 );
+ C_ASSERT( sizeof(struct get_key_state_request) == 24 );
+@@ -2049,6 +2076,11 @@ C_ASSERT( sizeof(struct get_directory_entries_request) == 24 );
+ C_ASSERT( offsetof(struct get_directory_entries_reply, total_len) == 8 );
+ C_ASSERT( offsetof(struct get_directory_entries_reply, count) == 12 );
+ C_ASSERT( sizeof(struct get_directory_entries_reply) == 16 );
++C_ASSERT( offsetof(struct query_directory_file_request, handle) == 12 );
++C_ASSERT( offsetof(struct query_directory_file_request, restart_scan) == 16 );
++C_ASSERT( sizeof(struct query_directory_file_request) == 24 );
++C_ASSERT( offsetof(struct query_directory_file_reply, total_len) == 8 );
++C_ASSERT( sizeof(struct query_directory_file_reply) == 16 );
+ C_ASSERT( offsetof(struct create_symlink_request, access) == 12 );
+ C_ASSERT( sizeof(struct create_symlink_request) == 16 );
+ C_ASSERT( offsetof(struct create_symlink_reply, handle) == 8 );
+@@ -2130,7 +2162,8 @@ C_ASSERT( sizeof(struct get_kernel_object_handle_request) == 32 );
+ C_ASSERT( offsetof(struct get_kernel_object_handle_reply, handle) == 8 );
+ C_ASSERT( sizeof(struct get_kernel_object_handle_reply) == 16 );
+ C_ASSERT( offsetof(struct make_process_system_request, handle) == 12 );
+-C_ASSERT( sizeof(struct make_process_system_request) == 16 );
++C_ASSERT( offsetof(struct make_process_system_request, desktop_close_timeout) == 16 );
++C_ASSERT( sizeof(struct make_process_system_request) == 24 );
+ C_ASSERT( offsetof(struct make_process_system_reply, event) == 8 );
+ C_ASSERT( sizeof(struct make_process_system_reply) == 16 );
+ C_ASSERT( offsetof(struct grant_process_admin_token_request, handle) == 12 );
+@@ -2317,9 +2350,11 @@ C_ASSERT( offsetof(struct get_inproc_sync_fd_request, handle) == 12 );
+ C_ASSERT( sizeof(struct get_inproc_sync_fd_request) == 16 );
+ C_ASSERT( offsetof(struct get_inproc_sync_fd_reply, type) == 8 );
+ C_ASSERT( offsetof(struct get_inproc_sync_fd_reply, access) == 12 );
+-C_ASSERT( sizeof(struct get_inproc_sync_fd_reply) == 16 );
++C_ASSERT( offsetof(struct get_inproc_sync_fd_reply, fsync_shm_idx) == 16 );
++C_ASSERT( sizeof(struct get_inproc_sync_fd_reply) == 24 );
+ C_ASSERT( sizeof(struct get_inproc_alert_fd_request) == 16 );
+ C_ASSERT( offsetof(struct get_inproc_alert_fd_reply, handle) == 8 );
++C_ASSERT( offsetof(struct get_inproc_alert_fd_reply, fsync_shm_idx) == 12 );
+ C_ASSERT( sizeof(struct get_inproc_alert_fd_reply) == 16 );
+ C_ASSERT( offsetof(struct d3dkmt_object_create_request, type) == 12 );
+ C_ASSERT( offsetof(struct d3dkmt_object_create_request, fd) == 16 );
+@@ -2374,3 +2409,6 @@ C_ASSERT( offsetof(struct d3dkmt_mutex_release_request, key_value) == 20 );
+ C_ASSERT( offsetof(struct d3dkmt_mutex_release_request, fence_value) == 24 );
+ C_ASSERT( offsetof(struct d3dkmt_mutex_release_request, runtime_size) == 32 );
+ C_ASSERT( sizeof(struct d3dkmt_mutex_release_request) == 40 );
++C_ASSERT( offsetof(struct fsync_free_shm_idx_request, shm_idx) == 12 );
++C_ASSERT( sizeof(struct fsync_free_shm_idx_request) == 16 );
++C_ASSERT( sizeof(struct fsync_free_shm_idx_reply) == 8 );
+diff --git a/server/request_trace.h b/server/request_trace.h
+index 7f379c2..3a1050d 100644
+--- a/server/request_trace.h
++++ b/server/request_trace.h
+@@ -22,9 +22,11 @@ static void dump_varargs_apc_call( const char *prefix, data_size_t size );
+ static void dump_varargs_apc_result( const char *prefix, data_size_t size );
+ static void dump_varargs_bytes( const char *prefix, data_size_t size );
+ static void dump_varargs_contexts( const char *prefix, data_size_t size );
++static void dump_varargs_cpu_topology_override( const char *prefix, data_size_t size );
+ static void dump_varargs_cursor_positions( const char *prefix, data_size_t size );
+ static void dump_varargs_debug_event( const char *prefix, data_size_t size );
+ static void dump_varargs_directory_entries( const char *prefix, data_size_t size );
++static void dump_varargs_directory_file_entries( const char *prefix, data_size_t size );
+ static void dump_varargs_filesystem_event( const char *prefix, data_size_t size );
+ static void dump_varargs_handle_infos( const char *prefix, data_size_t size );
+ static void dump_varargs_ints( const char *prefix, data_size_t size );
+@@ -125,6 +127,7 @@ static void dump_init_process_done_request( const struct init_process_done_reque
+ {
+     dump_uint64( " teb=", &req->teb );
+     dump_uint64( ", peb=", &req->peb );
++    dump_uint64( ", ldt_copy=", &req->ldt_copy );
+ }
+ 
+ static void dump_init_process_done_reply( const struct init_process_done_reply *req )
+@@ -139,6 +142,7 @@ static void dump_init_first_thread_request( const struct init_first_thread_reque
+     fprintf( stderr, ", debug_level=%d", req->debug_level );
+     fprintf( stderr, ", reply_fd=%d", req->reply_fd );
+     fprintf( stderr, ", wait_fd=%d", req->wait_fd );
++    dump_varargs_cpu_topology_override( ", cpu_override=", cur_size );
+ }
+ 
+ static void dump_init_first_thread_reply( const struct init_first_thread_reply *req )
+@@ -313,11 +317,13 @@ static void dump_set_thread_info_request( const struct set_thread_info_request *
+ static void dump_suspend_thread_request( const struct suspend_thread_request *req )
+ {
+     fprintf( stderr, " handle=%04x", req->handle );
++    fprintf( stderr, ", waited_handle=%04x", req->waited_handle );
+ }
+ 
+ static void dump_suspend_thread_reply( const struct suspend_thread_reply *req )
+ {
+     fprintf( stderr, " count=%d", req->count );
++    fprintf( stderr, ", wait_handle=%04x", req->wait_handle );
+ }
+ 
+ static void dump_resume_thread_request( const struct resume_thread_request *req )
+@@ -1118,6 +1124,20 @@ static void dump_flush_key_request( const struct flush_key_request *req )
+     fprintf( stderr, " hkey=%04x", req->hkey );
+ }
+ 
++static void dump_flush_key_reply( const struct flush_key_reply *req )
++{
++    dump_abstime( " timestamp_counter=", &req->timestamp_counter );
++    fprintf( stderr, ", total=%u", req->total );
++    fprintf( stderr, ", branch_count=%d", req->branch_count );
++    dump_varargs_bytes( ", data=", cur_size );
++}
++
++static void dump_flush_key_done_request( const struct flush_key_done_request *req )
++{
++    dump_abstime( " timestamp_counter=", &req->timestamp_counter );
++    fprintf( stderr, ", branch=%d", req->branch );
++}
++
+ static void dump_enum_key_request( const struct enum_key_request *req )
+ {
+     fprintf( stderr, " hkey=%04x", req->hkey );
+@@ -1200,7 +1220,12 @@ static void dump_unload_registry_request( const struct unload_registry_request *
+ static void dump_save_registry_request( const struct save_registry_request *req )
+ {
+     fprintf( stderr, " hkey=%04x", req->hkey );
+-    fprintf( stderr, ", file=%04x", req->file );
++}
++
++static void dump_save_registry_reply( const struct save_registry_reply *req )
++{
++    fprintf( stderr, " total=%u", req->total );
++    dump_varargs_bytes( ", data=", cur_size );
+ }
+ 
+ static void dump_set_registry_notification_request( const struct set_registry_notification_request *req )
+@@ -1457,6 +1482,18 @@ static void dump_send_hardware_message_reply( const struct send_hardware_message
+     fprintf( stderr, ", new_y=%d", req->new_y );
+ }
+ 
++static void dump_track_mouse_from_pointer_request( const struct track_mouse_from_pointer_request *req )
++{
++    fprintf( stderr, " win=%08x", req->win );
++    fprintf( stderr, ", msg=%08x", req->msg );
++    fprintf( stderr, ", pointer_id=%08x", req->pointer_id );
++}
++
++static void dump_track_mouse_from_pointer_reply( const struct track_mouse_from_pointer_reply *req )
++{
++    fprintf( stderr, " cursor_pos_updated=%d", req->cursor_pos_updated );
++}
++
+ static void dump_get_message_request( const struct get_message_request *req )
+ {
+     fprintf( stderr, " flags=%08x", req->flags );
+@@ -2159,6 +2196,7 @@ static void dump_set_user_object_info_request( const struct set_user_object_info
+     fprintf( stderr, " handle=%04x", req->handle );
+     fprintf( stderr, ", flags=%08x", req->flags );
+     fprintf( stderr, ", obj_flags=%08x", req->obj_flags );
++    dump_timeout( ", close_timeout=", &req->close_timeout );
+ }
+ 
+ static void dump_set_user_object_info_reply( const struct set_user_object_info_reply *req )
+@@ -2212,11 +2250,12 @@ static void dump_get_thread_input_reply( const struct get_thread_input_reply *re
+     dump_obj_locator( " locator=", &req->locator );
+ }
+ 
+-static void dump_get_last_input_time_request( const struct get_last_input_time_request *req )
++static void dump_set_user_input_time_request( const struct set_user_input_time_request *req )
+ {
++    fprintf( stderr, " set=%d", req->set );
+ }
+ 
+-static void dump_get_last_input_time_reply( const struct get_last_input_time_reply *req )
++static void dump_set_user_input_time_reply( const struct set_user_input_time_reply *req )
+ {
+     fprintf( stderr, " time=%08x", req->time );
+ }
+@@ -2848,6 +2887,18 @@ static void dump_get_directory_entries_reply( const struct get_directory_entries
+     dump_varargs_directory_entries( ", entries=", cur_size );
+ }
+ 
++static void dump_query_directory_file_request( const struct query_directory_file_request *req )
++{
++    fprintf( stderr, " handle=%04x", req->handle );
++    fprintf( stderr, ", restart_scan=%08x", req->restart_scan );
++}
++
++static void dump_query_directory_file_reply( const struct query_directory_file_reply *req )
++{
++    fprintf( stderr, " total_len=%u", req->total_len );
++    dump_varargs_directory_file_entries( ", entries=", cur_size );
++}
++
+ static void dump_create_symlink_request( const struct create_symlink_request *req )
+ {
+     fprintf( stderr, " access=%08x", req->access );
+@@ -3028,6 +3079,7 @@ static void dump_get_kernel_object_handle_reply( const struct get_kernel_object_
+ static void dump_make_process_system_request( const struct make_process_system_request *req )
+ {
+     fprintf( stderr, " handle=%04x", req->handle );
++    dump_timeout( ", desktop_close_timeout=", &req->desktop_close_timeout );
+ }
+ 
+ static void dump_make_process_system_reply( const struct make_process_system_reply *req )
+@@ -3396,6 +3448,7 @@ static void dump_get_inproc_sync_fd_reply( const struct get_inproc_sync_fd_reply
+ {
+     fprintf( stderr, " type=%d", req->type );
+     fprintf( stderr, ", access=%08x", req->access );
++    fprintf( stderr, ", fsync_shm_idx=%08x", req->fsync_shm_idx );
+ }
+ 
+ static void dump_get_inproc_alert_fd_request( const struct get_inproc_alert_fd_request *req )
+@@ -3405,6 +3458,7 @@ static void dump_get_inproc_alert_fd_request( const struct get_inproc_alert_fd_r
+ static void dump_get_inproc_alert_fd_reply( const struct get_inproc_alert_fd_reply *req )
+ {
+     fprintf( stderr, " handle=%04x", req->handle );
++    fprintf( stderr, ", fsync_shm_idx=%08x", req->fsync_shm_idx );
+ }
+ 
+ static void dump_d3dkmt_object_create_request( const struct d3dkmt_object_create_request *req )
+@@ -3509,6 +3563,11 @@ static void dump_d3dkmt_mutex_release_request( const struct d3dkmt_mutex_release
+     dump_varargs_bytes( ", runtime=", cur_size );
+ }
+ 
++static void dump_fsync_free_shm_idx_request( const struct fsync_free_shm_idx_request *req )
++{
++    fprintf( stderr, " shm_idx=%08x", req->shm_idx );
++}
++
+ typedef void (*dump_func)( const void *req );
+ 
+ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
+@@ -3603,6 +3662,7 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
+     (dump_func)dump_open_key_request,
+     (dump_func)dump_delete_key_request,
+     (dump_func)dump_flush_key_request,
++    (dump_func)dump_flush_key_done_request,
+     (dump_func)dump_enum_key_request,
+     (dump_func)dump_set_key_value_request,
+     (dump_func)dump_get_key_value_request,
+@@ -3635,6 +3695,7 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
+     (dump_func)dump_send_message_request,
+     (dump_func)dump_post_quit_message_request,
+     (dump_func)dump_send_hardware_message_request,
++    (dump_func)dump_track_mouse_from_pointer_request,
+     (dump_func)dump_get_message_request,
+     (dump_func)dump_reply_message_request,
+     (dump_func)dump_accept_hardware_message_request,
+@@ -3702,7 +3763,7 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
+     (dump_func)dump_unregister_hotkey_request,
+     (dump_func)dump_attach_thread_input_request,
+     (dump_func)dump_get_thread_input_request,
+-    (dump_func)dump_get_last_input_time_request,
++    (dump_func)dump_set_user_input_time_request,
+     (dump_func)dump_get_key_state_request,
+     (dump_func)dump_set_key_state_request,
+     (dump_func)dump_set_foreground_window_request,
+@@ -3755,6 +3816,7 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
+     (dump_func)dump_create_directory_request,
+     (dump_func)dump_open_directory_request,
+     (dump_func)dump_get_directory_entries_request,
++    (dump_func)dump_query_directory_file_request,
+     (dump_func)dump_create_symlink_request,
+     (dump_func)dump_open_symlink_request,
+     (dump_func)dump_query_symlink_request,
+@@ -3819,6 +3881,7 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
+     (dump_func)dump_d3dkmt_object_open_name_request,
+     (dump_func)dump_d3dkmt_mutex_acquire_request,
+     (dump_func)dump_d3dkmt_mutex_release_request,
++    (dump_func)dump_fsync_free_shm_idx_request,
+ };
+ 
+ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
+@@ -3912,6 +3975,7 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
+     (dump_func)dump_create_key_reply,
+     (dump_func)dump_open_key_reply,
+     NULL,
++    (dump_func)dump_flush_key_reply,
+     NULL,
+     (dump_func)dump_enum_key_reply,
+     NULL,
+@@ -3920,7 +3984,7 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
+     NULL,
+     NULL,
+     NULL,
+-    NULL,
++    (dump_func)dump_save_registry_reply,
+     NULL,
+     NULL,
+     (dump_func)dump_create_timer_reply,
+@@ -3945,6 +4009,7 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
+     NULL,
+     NULL,
+     (dump_func)dump_send_hardware_message_reply,
++    (dump_func)dump_track_mouse_from_pointer_reply,
+     (dump_func)dump_get_message_reply,
+     NULL,
+     NULL,
+@@ -4012,7 +4077,7 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
+     (dump_func)dump_unregister_hotkey_reply,
+     NULL,
+     (dump_func)dump_get_thread_input_reply,
+-    (dump_func)dump_get_last_input_time_reply,
++    (dump_func)dump_set_user_input_time_reply,
+     (dump_func)dump_get_key_state_reply,
+     NULL,
+     (dump_func)dump_set_foreground_window_reply,
+@@ -4065,6 +4130,7 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
+     (dump_func)dump_create_directory_reply,
+     (dump_func)dump_open_directory_reply,
+     (dump_func)dump_get_directory_entries_reply,
++    (dump_func)dump_query_directory_file_reply,
+     (dump_func)dump_create_symlink_reply,
+     (dump_func)dump_open_symlink_reply,
+     (dump_func)dump_query_symlink_reply,
+@@ -4129,6 +4195,7 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
+     (dump_func)dump_d3dkmt_object_open_name_reply,
+     (dump_func)dump_d3dkmt_mutex_acquire_reply,
+     NULL,
++    NULL,
+ };
+ 
+ static const char * const req_names[REQ_NB_REQUESTS] =
+@@ -4223,6 +4290,7 @@ static const char * const req_names[REQ_NB_REQUESTS] =
+     "open_key",
+     "delete_key",
+     "flush_key",
++    "flush_key_done",
+     "enum_key",
+     "set_key_value",
+     "get_key_value",
+@@ -4255,6 +4323,7 @@ static const char * const req_names[REQ_NB_REQUESTS] =
+     "send_message",
+     "post_quit_message",
+     "send_hardware_message",
++    "track_mouse_from_pointer",
+     "get_message",
+     "reply_message",
+     "accept_hardware_message",
+@@ -4322,7 +4391,7 @@ static const char * const req_names[REQ_NB_REQUESTS] =
+     "unregister_hotkey",
+     "attach_thread_input",
+     "get_thread_input",
+-    "get_last_input_time",
++    "set_user_input_time",
+     "get_key_state",
+     "set_key_state",
+     "set_foreground_window",
+@@ -4375,6 +4444,7 @@ static const char * const req_names[REQ_NB_REQUESTS] =
+     "create_directory",
+     "open_directory",
+     "get_directory_entries",
++    "query_directory_file",
+     "create_symlink",
+     "open_symlink",
+     "query_symlink",
+@@ -4439,6 +4509,7 @@ static const char * const req_names[REQ_NB_REQUESTS] =
+     "d3dkmt_object_open_name",
+     "d3dkmt_mutex_acquire",
+     "d3dkmt_mutex_release",
++    "fsync_free_shm_idx",
+ };
+ 
+ static const struct
+@@ -4518,7 +4589,6 @@ static const struct
+     { "INVALID_PIPE_STATE",          STATUS_INVALID_PIPE_STATE },
+     { "INVALID_READ_MODE",           STATUS_INVALID_READ_MODE },
+     { "INVALID_SECURITY_DESCR",      STATUS_INVALID_SECURITY_DESCR },
+-    { "INVALID_STATE_TRANSITION",    STATUS_INVALID_STATE_TRANSITION },
+     { "INVALID_USER_BUFFER",         STATUS_INVALID_USER_BUFFER },
+     { "IO_REPARSE_DATA_INVALID",     STATUS_IO_REPARSE_DATA_INVALID },
+     { "IO_REPARSE_TAG_INVALID",      STATUS_IO_REPARSE_TAG_INVALID },
+@@ -4545,6 +4615,7 @@ static const struct
+     { "NO_IMPERSONATION_TOKEN",      STATUS_NO_IMPERSONATION_TOKEN },
+     { "NO_MEMORY",                   STATUS_NO_MEMORY },
+     { "NO_MORE_ENTRIES",             STATUS_NO_MORE_ENTRIES },
++    { "NO_MORE_FILES",               STATUS_NO_MORE_FILES },
+     { "NO_SUCH_DEVICE",              STATUS_NO_SUCH_DEVICE },
+     { "NO_SUCH_FILE",                STATUS_NO_SUCH_FILE },
+     { "NO_TOKEN",                    STATUS_NO_TOKEN },

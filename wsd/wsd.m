@@ -229,6 +229,7 @@ static void probe_frame(WsdBuffer *b, uint64_t client_ns, uint64_t rx_ns) {
 @property uint32_t statCount;
 @property BOOL relative, clip, fullscreen, transitioning;
 @property BOOL nativeFullscreen, nativeFullscreenTransition, clientFullscreen, hasSavedStyle;
+@property BOOL directScanout, presentationHidden;
 /* the generation of a hide waiting HIDE_DELAY_NS for a show that would cancel it (-hideSoon), 0 for none */
 @property uint64_t pendingHide;
 /* visible as the client sees it: on screen, and no hide waiting */
@@ -239,8 +240,9 @@ static void probe_frame(WsdBuffer *b, uint64_t client_ns, uint64_t rx_ns) {
 @property uint64_t shownNs;
 @property BOOL stalled;
 /* overlay plane (PRESENT_REGION, e.g. a D3D swapchain in the client area): a WsdWindow without an NSWindow of its
- * own, whose layer is a sublayer of the view's layer */
+ * own, whose layer is a sublayer of the view's layer (or promoted to the root CAMetalLayer in directScanout mode) */
 @property(strong) WsdWindow *overlay;
+@property(strong) CAMetalLayer *overlaySublayer;
 @property BOOL isOverlay;
 @property(weak) WsdWindow *base; /* an overlay's window */
 /* the overlay plane was removed and the base plane has shown no frame since (-pointerScale) */
@@ -1464,7 +1466,15 @@ static CAMetalLayer *make_metal_layer(void) {
 }
 - (void)refreshOverlayFrame {
   WsdWindow *o = self.overlay;
-  if (!o || !o.layer || !o.layer.superlayer || self.overlayPx.size.width <= 0 || self.overlayPx.size.height <= 0) return;
+  if (!o || self.overlayPx.size.width <= 0 || self.overlayPx.size.height <= 0) return;
+  if (self.directScanout) {
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    self.layer.frame = self.view.bounds;
+    [CATransaction commit];
+    return;
+  }
+  if (!o.layer || !o.layer.superlayer) return;
   WsdScale s = backing_scale_xy(self.window);
   NSSize vs = self.view.bounds.size;
   NSRect px = self.overlayPx;
@@ -1474,8 +1484,66 @@ static CAMetalLayer *make_metal_layer(void) {
                              px.size.height / s.y);
   [CATransaction commit];
 }
+- (BOOL)isDirectScanoutCandidate {
+  if (!(self.fullscreen || self.nativeFullscreen) || self.transitioning || self.nativeFullscreenTransition)
+    return NO;
+  WsdWindow *o = self.overlay;
+  if (!o || !self.view || self.overlayPx.size.width <= 0 || self.overlayPx.size.height <= 0)
+    return NO;
+  WsdScale s = backing_scale_xy(self.window);
+  NSSize vs = self.view.bounds.size;
+  if (vs.width <= 0.0 || vs.height <= 0.0 || s.x <= 0.0 || s.y <= 0.0)
+    return NO;
+  double ox = self.overlayPx.origin.x / s.x;
+  double oy = self.overlayPx.origin.y / s.y;
+  double ow = self.overlayPx.size.width / s.x;
+  double oh = self.overlayPx.size.height / s.y;
+  return ox <= 4.0 && oy <= 4.0 && fabs(ow - vs.width) <= 6.0 && fabs(oh - vs.height) <= 6.0;
+}
+- (void)syncDirectScanout {
+  BOOL want = [self isDirectScanoutCandidate];
+  WsdWindow *o = self.overlay;
+  if (want && o) {
+    if (!self.directScanout || o.layer != self.layer || o.overlaySublayer.superlayer != nil) {
+      [CATransaction begin];
+      [CATransaction setDisableActions:YES];
+      if (o.overlaySublayer.superlayer) [o.overlaySublayer removeFromSuperlayer];
+      o.layer = self.layer;
+      self.layer.frame = self.view.bounds;
+      double backing = self.window.backingScaleFactor > 0.0 ? self.window.backingScaleFactor : 1.0;
+      self.layer.contentsScale = backing;
+      [CATransaction commit];
+      BOOL changed = !self.directScanout;
+      self.directScanout = YES;
+      if (changed) {
+        NSSize backingPx = [self.view convertSizeToBacking:self.view.bounds.size];
+        LOG("window %u: direct-to-display ON (root CAMetalLayer %.0fx%.0f pt, %.0fx%.0f px, level=%ld)",
+            self.windowId, self.view.bounds.size.width, self.view.bounds.size.height,
+            backingPx.width, backingPx.height, (long)self.window.level);
+      }
+    }
+  } else {
+    BOOL changed = self.directScanout;
+    self.directScanout = NO;
+    if (o && o.overlaySublayer) {
+      if (o.layer != o.overlaySublayer || !o.overlaySublayer.superlayer) {
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        o.layer = o.overlaySublayer;
+        if (!o.overlaySublayer.superlayer) [self.view.layer addSublayer:o.overlaySublayer];
+        [CATransaction commit];
+        [self refreshOverlayFrame];
+      }
+    }
+    if (changed) {
+      self.redisplay = YES;
+      LOG("window %u: direct-to-display OFF (overlay sublayer)", self.windowId);
+    }
+  }
+}
 - (void)windowDidResize:(NSNotification *)n {
   if (self.transitioning) return; /* one RESIZE per fullscreen transition */
+  [self syncDirectScanout];
   [self refreshOverlayFrame];
   [self sendResize];
   [self sendFrame];
@@ -1484,17 +1552,21 @@ static CAMetalLayer *make_metal_layer(void) {
   self.transitioning = YES;
   self.nativeFullscreenTransition = YES;
   if (!self.hasSavedStyle) self.savedStyle = self.window.styleMask & ~NSWindowStyleMaskFullScreen;
+  [self syncDirectScanout];
   LOG("window %u: entering macOS native fullscreen", self.windowId);
 }
 - (void)windowDidFailToEnterFullScreen:(NSWindow *)window {
   self.nativeFullscreenTransition = NO;
   self.transitioning = NO;
+  [self syncDirectScanout];
   LOG("window %u: failed to enter macOS native fullscreen", self.windowId);
 }
 - (void)windowDidEnterFullScreen:(NSNotification *)n {
   self.nativeFullscreen = YES;
   self.nativeFullscreenTransition = NO;
   self.transitioning = NO;
+  self.window.hasShadow = NO;
+  [self syncDirectScanout];
   [self refreshOverlayFrame];
   [self logState:"native-fullscreen-on"];
   [self sendResize];
@@ -1503,11 +1575,13 @@ static CAMetalLayer *make_metal_layer(void) {
 - (void)windowWillExitFullScreen:(NSNotification *)n {
   self.transitioning = YES;
   self.nativeFullscreenTransition = YES;
+  [self syncDirectScanout];
   LOG("window %u: exiting macOS native fullscreen", self.windowId);
 }
 - (void)windowDidFailToExitFullScreen:(NSWindow *)window {
   self.nativeFullscreenTransition = NO;
   self.transitioning = NO;
+  [self syncDirectScanout];
   LOG("window %u: failed to exit macOS native fullscreen", self.windowId);
 }
 - (void)windowDidExitFullScreen:(NSNotification *)n {
@@ -1515,6 +1589,7 @@ static CAMetalLayer *make_metal_layer(void) {
   self.nativeFullscreenTransition = NO;
   self.clientFullscreen = NO;
   self.transitioning = NO;
+  self.window.hasShadow = YES;
   if (self.hasSavedStyle) {
     self.hasSavedStyle = NO;
     NSWindow *w = self.window;
@@ -1531,6 +1606,7 @@ static CAMetalLayer *make_metal_layer(void) {
     }
   }
   adjust_levels(NSApp.active);
+  [self syncDirectScanout];
   [self refreshOverlayFrame];
   [self logState:"native-fullscreen-off"];
   [self sendResize];
@@ -1667,11 +1743,36 @@ static CAMetalLayer *make_metal_layer(void) {
 
 /* Display-link tick: encode the latest pending frame, if any. */
 - (void)tick:(CADisplayLink *)link {
-  [self tickPlane];
+  if (self.directScanout) {
+    /* Root CAMetalLayer is owned directly by the fullscreen D3D overlay for Direct-to-Display.
+     * Release any incoming GDI base frame without drawing so GDI clients never stall. */
+    if (self.pendingBuffer) {
+      WsdBuffer *b = self.pendingBuffer;
+      uint64_t serial = self.pendingSerial;
+      uint64_t now = now_ns();
+      struct wsd_ev_presented ev = {self.windowId, b.bufferId, serial, self.pendingClientNs,
+                                    self.pendingReceivedNs, now, now, self.replaced, 0};
+      self.pendingBuffer = nil;
+      self.lastBuffer = b;
+      self.replaced = 0;
+      [self sendEvent:WSD_EV_PRESENTED payload:&ev len:sizeof(ev) extra:nil];
+      [self releaseBuffer:b serial:serial shown:YES];
+    }
+  } else {
+    [self tickPlane];
+  }
   if (self.overlay) [self.overlay tickPlane];
 }
 
 - (CGSize)presentationSizeForWidth:(NSUInteger)bufWidth height:(NSUInteger)bufHeight {
+  if (self.isOverlay && self.base.directScanout && self.base.view) {
+    /* Direct-to-Display requires exact native backing pixels matching the fullscreen view. */
+    NSSize backingPx = [self.base.view convertSizeToBacking:self.base.view.bounds.size];
+    NSUInteger width = (NSUInteger)llround(backingPx.width);
+    NSUInteger height = (NSUInteger)llround(backingPx.height);
+    if (width > 0 && height > 0 && width <= 8192 && height <= 8192)
+      return CGSizeMake(width, height);
+  }
   if (!g_spatial_upscale || !self.isOverlay)
     return CGSizeMake(bufWidth, bufHeight);
   double backing = self.window.backingScaleFactor;
@@ -1881,8 +1982,9 @@ static CAMetalLayer *make_metal_layer(void) {
   NSUInteger srcWidth = presentHeldReal ? self.fgWidth : b.width;
   NSUInteger srcHeight = presentHeldReal ? self.fgHeight : b.height;
   CGSize want = [self presentationSizeForWidth:srcWidth height:srcHeight];
+  BOOL direct = self.isOverlay && self.base.directScanout;
   BOOL upscaling = want.width > srcWidth || want.height > srcHeight;
-  double wantScale = upscaling ? self.window.backingScaleFactor : backing_scale(self.window);
+  double wantScale = (direct || upscaling) ? self.window.backingScaleFactor : backing_scale(self.window);
   if (wantScale > 0.0 && fabs(self.layer.contentsScale - wantScale) > 1e-6) self.layer.contentsScale = wantScale;
   if (!CGSizeEqualToSize(self.layer.drawableSize, want)) self.layer.drawableSize = want;
   id<CAMetalDrawable> d = [self.layer nextDrawable];
@@ -2133,7 +2235,7 @@ static CAMetalLayer *make_metal_layer(void) {
  * keyboard and the mouse under the game's picture (2026-10-23, Rocket League in fullscreen). The presentation options
  * need nothing of the kind: macOS applies them only while the app is active. */
 - (NSWindowLevel)levelForActive:(BOOL)active {
-  if (self.fullscreen && active) return NSMainMenuWindowLevel + 1;
+  if (self.fullscreen && active) return self.presentationHidden ? NSNormalWindowLevel : (NSMainMenuWindowLevel + 1);
   return [self floatsForActive:active] ? NSFloatingWindowLevel : NSNormalWindowLevel;
 }
 
@@ -2191,25 +2293,31 @@ static CAMetalLayer *make_metal_layer(void) {
     self.savedStyle = w.styleMask;
     w.collectionBehavior = NSWindowCollectionBehaviorFullScreenNone;
     w.styleMask = NSWindowStyleMaskBorderless;
+    w.hasShadow = NO;
     [w setFrame:w.screen ? w.screen.frame : primary_screen().frame display:YES];
     @try {
       NSApp.presentationOptions = NSApplicationPresentationHideDock | NSApplicationPresentationHideMenuBar;
+      self.presentationHidden = YES;
     } @catch (NSException *ex) {
+      self.presentationHidden = NO;
       LOG("presentationOptions refused: %s", ex.reason.UTF8String);
     }
   } else {
     w.styleMask = self.savedStyle;
+    w.hasShadow = YES;
     BOOL canNativeFS = (self.savedStyle & NSWindowStyleMaskTitled) && (self.savedStyle & NSWindowStyleMaskResizable);
     w.collectionBehavior = canNativeFS ? NSWindowCollectionBehaviorFullScreenPrimary
                                        : NSWindowCollectionBehaviorFullScreenNone;
     [w setFrame:self.savedFrame display:YES];
     NSApp.presentationOptions = NSApplicationPresentationDefault;
+    self.presentationHidden = NO;
   }
   [w makeFirstResponder:self.view];
   self.transitioning = NO;
   self.fullscreen = on;
   self.hasSavedStyle = NO;
   adjust_levels(NSApp.active);
+  [self syncDirectScanout];
   [self logState:on ? "fullscreen-on" : "fullscreen-off"];
   [self sendResize];
 }
@@ -2221,9 +2329,11 @@ static CAMetalLayer *make_metal_layer(void) {
   o.pendingBuffer = nil;
   o.lastBuffer = nil;
   [o resetFrameGen];
-  [o.layer removeFromSuperlayer];
+  if (o.overlaySublayer.superlayer) [o.overlaySublayer removeFromSuperlayer];
   self.overlay = nil;
+  self.directScanout = NO;
   self.overlayGone = YES;
+  self.redisplay = YES;
 }
 
 /* Places the overlay plane at a rectangle of the content view given in pixels (top-left origin). */
@@ -2239,23 +2349,29 @@ static CAMetalLayer *make_metal_layer(void) {
     o.windowId = self.windowId;
     o.client = self.client;
     o.window = self.window;
-    o.layer = make_metal_layer();
-    o.layer.contentsScale = s.x;
-    [self.view.layer addSublayer:o.layer];
+    o.overlaySublayer = make_metal_layer();
+    o.overlaySublayer.contentsScale = s.x;
+    o.layer = o.overlaySublayer;
     self.overlay = o;
     LOG("window %u: overlay plane created", self.windowId);
   }
+  BOOL rectChanged = created || !NSEqualRects(px, self.overlayPx);
+  self.overlayPx = px;
+  [self syncDirectScanout];
   /* A new plane is placed even at the rectangle of the one before it: a game that recreates its swapchain removes
    * the plane and presents again to the same rectangle, and the new layer would stay 0x0 (never displayed). */
-  if (created || !NSEqualRects(px, self.overlayPx) || !o.layer.superlayer) {
+  if (!self.directScanout && (rectChanged || !o.overlaySublayer.superlayer)) {
     NSSize vs = self.view.bounds.size;
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
-    o.layer.frame = CGRectMake(px.origin.x / s.x, vs.height - (px.origin.y + px.size.height) / s.y, px.size.width / s.x,
-                               px.size.height / s.y);
+    if (!o.overlaySublayer.superlayer) [self.view.layer addSublayer:o.overlaySublayer];
+    o.overlaySublayer.frame = CGRectMake(px.origin.x / s.x, vs.height - (px.origin.y + px.size.height) / s.y,
+                                         px.size.width / s.x, px.size.height / s.y);
     [CATransaction commit];
-    self.overlayPx = px;
     LOG("window %u: overlay at px (%.0f,%.0f %.0fx%.0f)", self.windowId, px.origin.x, px.origin.y, px.size.width, px.size.height);
+  } else if (rectChanged && self.directScanout) {
+    LOG("window %u: direct-to-display rect px (%.0f,%.0f %.0fx%.0f)", self.windowId, px.origin.x, px.origin.y,
+        px.size.width, px.size.height);
   }
   return o;
 }
@@ -2413,6 +2529,7 @@ static CGPoint warp_point(WsdClient *c, int32_t x, int32_t y) {
   w.client = self;
   w.window = [[WsdNSWindow alloc] initWithContentRect:r styleMask:style backing:NSBackingStoreBuffered defer:NO];
   w.window.releasedWhenClosed = NO;
+  w.window.opaque = YES;
   w.window.backgroundColor = NSColor.blackColor;
   /* Titled, resizable windows (e.g. VRChat) support native macOS Full Screen via the green button or Ctrl+Cmd+F
    * (Option-clicking the green button still zooms through WSD_EV_ZOOM). Borderless/fixed windows stay non-fullscreen
